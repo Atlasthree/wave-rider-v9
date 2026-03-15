@@ -655,7 +655,6 @@ def evaluate_alert(addr):
     # ENTRY FILTERS
     entry_filters["top1_gte_99"] = top1 >= 99
     entry_filters["bundle_detected"] = bundle == 1
-    entry_filters["sweet_spot"] = SWEET_SPOT_LOW <= first_price <= SWEET_SPOT_HIGH if first_price else False
     entry_filters["price_up_5pct"] = current_gain > 5
     
     # KILL SIGNALS
@@ -678,12 +677,12 @@ def evaluate_alert(addr):
     # SAFETY CHECKS
     safety_checks["freeze_authority"] = "BLOCK" if freeze == 1 else "PASS"
     safety_checks["mint_authority"] = "WARN" if mint == 1 else "PASS"
-    safety_checks["liquidity_gte_5k"] = "BLOCK" if liq < 5000 else "PASS"
+    safety_checks["liquidity"] = f"${liq:.0f}" if liq else "$0"
 
     # All entry filters must pass
     all_entry = all(entry_filters.values())
-    # Safety blocks
-    blocked = safety_checks["freeze_authority"] == "BLOCK" or safety_checks["liquidity_gte_5k"] == "BLOCK"
+    # Safety blocks — only freeze authority is a hard block
+    blocked = safety_checks["freeze_authority"] == "BLOCK"
 
     if not all_entry or blocked:
         logger.info("Alert SKIP %s (%s): entry=%s safety=%s kill=%s",
