@@ -422,6 +422,7 @@ def collect_price_snapshots():
             if price <= 0:
                 continue
             ts = time.time()
+            price_is_glitch = False
             with state_lock:
                 tok = state["tokens"].get(addr)
                 if tok:
@@ -429,31 +430,33 @@ def collect_price_snapshots():
                         tok["first_price"] = price
                     # GLITCH FILTER: reject price if >100x jump from last known price
                     last_price = tok.get("current_price") or tok.get("first_price")
-                    if last_price and last_price > 0 and price / last_price > 100:
+                    price_is_glitch = last_price and last_price > 0 and price / last_price > 100
+                    if price_is_glitch:
                         logger.warning("GLITCH rejected %s: $%.6f -> $%.6f (%.0fx jump)",
                                        tok.get("symbol", addr[:8]), last_price, price, price / last_price)
-                        continue
-                    tok["current_price"] = price
-                    if price > (tok.get("peak_price") or 0):
-                        tok["peak_price"] = price
-                        tok["time_to_peak_seconds"] = ts - tok["detected_at"]
-                    first_p = tok.get("first_price", price)
-                    tok["peak_gain_pct"] = ((tok.get("peak_price", price) / first_p) - 1) * 100 if first_p else 0
-                    tok["current_gain_pct"] = ((price / first_p) - 1) * 100 if first_p else 0
-                    tok["current_liquidity"] = liq
-                    if not tok.get("initial_liquidity"):
-                        tok["initial_liquidity"] = liq
-                    tok["last_snapshot"] = ts
-                    snap_count = tok.get("snapshot_count", 0) + 1
-                    tok["snapshot_count"] = snap_count
-            with get_db() as db:
-                db.execute("INSERT INTO snapshots (token_address,ts,price,liquidity_usd,volume_5m,fdv,mcap) VALUES (?,?,?,?,?,?,?)",
-                           (addr, ts, price, liq, vol, fdv, mcap))
-                db.execute("""UPDATE tokens SET first_price=COALESCE(NULLIF(first_price,0),?),
-                    current_price=?, peak_price=MAX(COALESCE(peak_price,0),?),
-                    initial_liquidity=COALESCE(NULLIF(initial_liquidity,0),?),
-                    snapshot_count=snapshot_count+1 WHERE address=?""",
-                    (price, price, price, liq, addr))
+                    else:
+                        tok["current_price"] = price
+                        if price > (tok.get("peak_price") or 0):
+                            tok["peak_price"] = price
+                            tok["time_to_peak_seconds"] = ts - tok["detected_at"]
+                        first_p = tok.get("first_price", price)
+                        tok["peak_gain_pct"] = ((tok.get("peak_price", price) / first_p) - 1) * 100 if first_p else 0
+                        tok["current_gain_pct"] = ((price / first_p) - 1) * 100 if first_p else 0
+                        tok["current_liquidity"] = liq
+                        if not tok.get("initial_liquidity"):
+                            tok["initial_liquidity"] = liq
+                        tok["last_snapshot"] = ts
+                        snap_count = tok.get("snapshot_count", 0) + 1
+                        tok["snapshot_count"] = snap_count
+            if not (state["tokens"].get(addr, {}).get("current_price") and price_is_glitch):
+                with get_db() as db:
+                    db.execute("INSERT INTO snapshots (token_address,ts,price,liquidity_usd,volume_5m,fdv,mcap) VALUES (?,?,?,?,?,?,?)",
+                               (addr, ts, price, liq, vol, fdv, mcap))
+                    db.execute("""UPDATE tokens SET first_price=COALESCE(NULLIF(first_price,0),?),
+                        current_price=?, peak_price=MAX(COALESCE(peak_price,0),?),
+                        initial_liquidity=COALESCE(NULLIF(initial_liquidity,0),?),
+                        snapshot_count=snapshot_count+1 WHERE address=?""",
+                        (price, price, price, liq, addr))
 
 
 # ─── Enrichment ──────────────────────────────────────────────────────────────
