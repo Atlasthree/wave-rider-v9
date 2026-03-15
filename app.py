@@ -427,6 +427,12 @@ def collect_price_snapshots():
                 if tok:
                     if not tok.get("first_price"):
                         tok["first_price"] = price
+                    # GLITCH FILTER: reject price if >100x jump from last known price
+                    last_price = tok.get("current_price") or tok.get("first_price")
+                    if last_price and last_price > 0 and price / last_price > 100:
+                        logger.warning("GLITCH rejected %s: $%.6f -> $%.6f (%.0fx jump)",
+                                       tok.get("symbol", addr[:8]), last_price, price, price / last_price)
+                        continue
                     tok["current_price"] = price
                     if price > (tok.get("peak_price") or 0):
                         tok["peak_price"] = price
