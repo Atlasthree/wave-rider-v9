@@ -1004,7 +1004,6 @@ def cleanup_old():
 def main_loop():
     """Background thread running every 3 seconds."""
     logger.info("🌊 Wave Rider %s starting main loop", VERSION)
-    init_db()
 
     # Initial data fetch
     refresh_sol_price()
@@ -1160,6 +1159,7 @@ def startup():
     global _bg_thread_started
     if not _bg_thread_started:
         _bg_thread_started = True
+        init_db()  # Create DB before any route can query it
         t = threading.Thread(target=main_loop, daemon=True)
         t.start()
         logger.info("Background thread started")
