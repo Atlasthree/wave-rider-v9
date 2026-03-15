@@ -655,48 +655,16 @@ def evaluate_alert(addr):
         symbol = tok.get("symbol", "???")
 
     # Build filter results
-    entry_signals = {}
+    entry_filters = {}
     safety_checks = {}
 
-    # ── SIGNAL SCORING (OR-based, not AND) ──
-    # Each signal adds points. Minimum threshold to trade.
-    score = 0
-    entry_signals["price_up"] = current_gain > 5
-    entry_signals["price_pct"] = f"{current_gain:+.1f}%"
-    entry_signals["top1_pct"] = f"{top1:.1f}%"
-    entry_signals["bundle"] = bundle == 1
+    # ENTRY FILTERS — OR-based scoring (not AND)
+    entry_filters["top1_gte_99"] = top1 >= 99
+    entry_filters["top1_gte_95"] = top1 >= 95
+    entry_filters["bundle_detected"] = bundle == 1
+    entry_filters["price_up_5pct"] = current_gain > 5
     
-    # Price momentum — THE primary signal (required)
-    if current_gain > 5:
-        score += 3  # strong momentum
-    elif current_gain > 0:
-        score += 1  # slight green
-    
-    # Holder concentration — graded
-    if top1 >= 99:
-        score += 3  # ultra-whale (best from data: 51% moon)
-    elif top1 >= 95:
-        score += 2  # high concentration (46% moon)
-    elif top1 >= 80:
-        score += 1  # moderate (Strategy C territory)
-    
-    # Bundle detection
-    if bundle == 1:
-        score += 2  # coordinated buying (2x moon rate)
-    
-    # Night hours bonus (22-07 UTC = best hours from data)
-    is_night = hour >= 22 or hour < 7
-    if is_night:
-        score += 1
-    
-    # Fast curve bonus
-    fast_curve = curve_dur < 60
-    if fast_curve:
-        score += 1
-
-    entry_signals["score"] = score
-    
-    # ── KILL SIGNALS (hard blocks) ──
+    # KILL SIGNALS
     kill = False
     kill_reasons = []
     if curve_dur > 300:
@@ -709,53 +677,53 @@ def evaluate_alert(addr):
         kill = True
         kill_reasons.append(f"serial_creator={creator_prev}")
     
-    entry_signals["no_kill"] = not kill
+    entry_filters["no_kill_signal"] = not kill
 
-    # ── SAFETY CHECKS ──
+    # SAFETY CHECKS
     safety_checks["freeze_authority"] = "BLOCK" if freeze == 1 else "PASS"
     safety_checks["mint_authority"] = "WARN" if mint == 1 else "PASS"
     safety_checks["liquidity"] = f"${liq:.0f}" if liq else "$0"
-    # Zero liquidity: WARN but don't block (DexScreener lags at 35s)
+    # Zero liquidity: WARN only (DexScreener lags at 35s — false positive)
     safety_checks["zero_liquidity"] = "WARN" if liq == 0 else "PASS"
 
-    # ── ENTRY DECISION ──
-    # Hard blocks: freeze authority or kill signals
-    blocked = safety_checks["freeze_authority"] == "BLOCK" or kill
+    # ENTRY LOGIC — need price momentum + at least one holder signal
+    has_momentum = entry_filters["price_up_5pct"]
+    has_holder_signal = entry_filters["top1_gte_95"] or entry_filters["bundle_detected"]
+    no_kill = entry_filters["no_kill_signal"]
     
-    # Minimum score to trade: 4 points
-    # Examples that pass:
-    #   price_up(3) + top1≥99%(3) = 6 → A-grade (MetaMask, WOOF)
-    #   price_up(3) + bundle(2) = 5 → B-grade (TIM)
-    #   price_up(3) + top1≥95%(2) = 5 → B-grade
-    #   price_up(3) + top1≥80%(1) + night(1) = 5 → B-grade (Strategy C)
-    #   top1≥99%(3) + bundle(2) = 5 → B-grade (no price confirm yet)
-    #   price_up(3) + top1≥80%(1) = 4 → C-grade (minimum)
-    # Examples that DON'T pass:
-    #   price_up(3) alone = 3 → skip (no holder signal)
-    #   top1≥99%(3) alone = 3 → skip (no momentum)
-    #   bundle(2) + slight_green(1) = 3 → skip
+    # Pass if: momentum + holder signal + no kill
+    # OR: top1>=99 + bundle (even without price confirm)
+    entry_pass = (has_momentum and has_holder_signal and no_kill) or \
+                 (entry_filters["top1_gte_99"] and entry_filters["bundle_detected"] and no_kill)
     
-    if blocked or score < 4:
-        logger.info("Alert SKIP %s (%s): score=%d entry=%s safety=%s kill=%s",
-                     symbol, addr[:8], score, entry_signals, safety_checks, kill_reasons)
+    # Safety blocks — freeze authority only (zero liq no longer blocks)
+    blocked = safety_checks["freeze_authority"] == "BLOCK"
+
+    if not entry_pass or blocked:
+        logger.info("Alert SKIP %s (%s): entry=%s safety=%s kill=%s",
+                     symbol, addr[:8], entry_filters, safety_checks, kill_reasons)
         return None
 
-    # ── GRADE ASSIGNMENT ──
-    if score >= 7:
-        grade = "A+"  # whale + bundle + momentum + bonus
-    elif score >= 6:
-        grade = "A"   # strong multi-signal
-    elif score >= 5:
-        grade = "B"   # solid two-signal
+    # Determine grade
+    is_night = hour >= 22 or hour < 7
+    fast_curve = curve_dur < 60
+    if entry_filters["top1_gte_99"] and entry_filters["bundle_detected"] and has_momentum:
+        grade = "A"
+    elif has_momentum and entry_filters["top1_gte_99"]:
+        grade = "A"
+    elif has_momentum and has_holder_signal and is_night:
+        grade = "B"
+    elif has_momentum and has_holder_signal:
+        grade = "B"
     else:
-        grade = "C"   # minimum threshold
+        grade = "C"
 
     # Store alert
     ts = time.time()
     with get_db() as db:
         db.execute("""INSERT INTO alerts (token_address,symbol,ts,grade,entry_filters,safety_checks,price_at_alert,action)
             VALUES (?,?,?,?,?,?,?,?)""",
-            (addr, symbol, ts, grade, json.dumps(entry_signals), json.dumps(safety_checks), current_price, "pending"))
+            (addr, symbol, ts, grade, json.dumps(entry_filters), json.dumps(safety_checks), current_price, "pending"))
 
     logger.info("🚨 ALERT %s-grade: %s (%s) price=$%.6f gain=%.1f%%",
                 grade, symbol, addr[:8], current_price, current_gain)
