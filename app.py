@@ -204,7 +204,13 @@ def safe_post(url, payload, timeout=8):
     try:
         r = sess.post(url, json=payload, timeout=timeout)
         if r.status_code == 200:
-            return r.json()
+            data = r.json()
+            if "error" in data:
+                logger.warning("RPC error: %s", str(data["error"])[:100])
+                return None
+            return data
+        elif r.status_code == 429:
+            logger.warning("Rate limited on POST %s", url[:80])
     except Exception as e:
         logger.debug("POST %s failed: %s", url[:80], e)
     return None
@@ -1147,8 +1153,8 @@ def main_loop():
             now = time.time()
             with state_lock:
                 to_enrich = [(addr, tok) for addr, tok in state["tokens"].items()
-                             if not tok.get("enriched") and 30 <= now - tok["detected_at"] <= 40]
-            for addr, tok in to_enrich[:3]:  # max 3 per tick to avoid rate limits
+                             if not tok.get("enriched") and 25 <= now - tok["detected_at"] <= 60]
+            for addr, tok in to_enrich[:1]:  # max 1 per tick — Helius free tier rate limit
                 try:
                     enrich_token(addr)
                 except Exception as e:
