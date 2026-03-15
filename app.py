@@ -20,7 +20,7 @@ from flask import Flask, jsonify, request, g
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 VERSION = "v9.2-shadow"
-HELIUS_KEY = "b85d5357-36d9-4e26-b945-f38a0677b391"
+HELIUS_KEY = "6ac59b75-262f-4f22-ae79-749c4bcefdc2"
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
 HELIUS_API = f"https://api.helius.xyz/v0"
 DEXSCREENER_BATCH = "https://api.dexscreener.com/latest/dex/tokens"
