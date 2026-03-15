@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request, g
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
-VERSION = "v9-shadow"
+VERSION = "v9.2-shadow"
 HELIUS_KEY = "b85d5357-36d9-4e26-b945-f38a0677b391"
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
 HELIUS_API = f"https://api.helius.xyz/v0"
@@ -39,8 +39,8 @@ BUY_SLIPPAGE = 0.03
 SELL_SLIPPAGE = 0.03
 TRAILING_STOP_PCT = 30
 STOP_LOSS_PCT = 30
-TAKE_PROFIT_1_PCT = 100
-HARD_EXIT_SECONDS = 300
+TAKE_PROFIT_1_PCT = 50
+HARD_EXIT_SECONDS = 480
 MAX_HOLD_SECONDS = 600
 EMERGENCY_LIQ_DROP_PCT = 30
 SWEET_SPOT_LOW = 0.001
@@ -144,7 +144,11 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
     exit_reason TEXT DEFAULT '',
     pnl_sol REAL DEFAULT 0, pnl_pct REAL DEFAULT 0,
     peak_price_during REAL DEFAULT 0,
-    status TEXT DEFAULT 'open'
+    status TEXT DEFAULT 'open',
+    price_2min_after_exit REAL DEFAULT 0,
+    price_5min_after_exit REAL DEFAULT 0,
+    price_10min_after_exit REAL DEFAULT 0,
+    hindsight_checked INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS missed_opportunities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -678,11 +682,12 @@ def evaluate_alert(addr):
     safety_checks["freeze_authority"] = "BLOCK" if freeze == 1 else "PASS"
     safety_checks["mint_authority"] = "WARN" if mint == 1 else "PASS"
     safety_checks["liquidity"] = f"${liq:.0f}" if liq else "$0"
+    safety_checks["zero_liquidity"] = "BLOCK" if liq == 0 else "PASS"
 
     # All entry filters must pass
     all_entry = all(entry_filters.values())
-    # Safety blocks — only freeze authority is a hard block
-    blocked = safety_checks["freeze_authority"] == "BLOCK"
+    # Safety blocks — freeze authority OR zero liquidity
+    blocked = safety_checks["freeze_authority"] == "BLOCK" or safety_checks["zero_liquidity"] == "BLOCK"
 
     if not all_entry or blocked:
         logger.info("Alert SKIP %s (%s): entry=%s safety=%s kill=%s",
@@ -721,6 +726,16 @@ def can_open_position():
         if time.time() - state["last_close_time"] < COOLDOWN_SECONDS:
             return False, "cooldown"
     return True, ""
+
+
+def already_traded(addr):
+    """Check if we already have an open or closed trade for this token."""
+    with state_lock:
+        if addr in state["open_positions"]:
+            return True
+    with get_db() as db:
+        row = db.execute("SELECT COUNT(*) as c FROM shadow_trades WHERE token_address=?", (addr,)).fetchone()
+        return row["c"] > 0
 
 
 def open_shadow_position(addr, grade):
@@ -998,6 +1013,87 @@ def cleanup_old():
         logger.info("Cleaned up %d old tokens from memory", len(to_remove))
 
 
+def post_trade_hindsight():
+    """After closing a trade, check what the token did 2/5/10 min later.
+    This tells us: did we exit too early? Too late? Data for tuning."""
+    now = time.time()
+    with get_db() as db:
+        # Find closed trades where we haven't done hindsight yet
+        # and enough time has passed (at least 10 min after exit)
+        trades = db.execute("""
+            SELECT id, token_address, symbol, exit_time, entry_price, exit_price, exit_reason, pnl_pct
+            FROM shadow_trades
+            WHERE status='closed' AND hindsight_checked=0 AND exit_time > 0
+            AND ? - exit_time > 600
+            LIMIT 5
+        """, (now,)).fetchall()
+
+    if not trades:
+        return
+
+    for trade in trades:
+        addr = trade["token_address"]
+        exit_time = trade["exit_time"]
+        entry_price = trade["entry_price"]
+        symbol = trade["symbol"]
+
+        # Fetch current price from DexScreener
+        try:
+            url = f"{DEXSCREENER_BATCH}/{addr}"
+            resp = requests.get(url, timeout=5)
+            data = resp.json()
+            pairs = data.get("pairs") or []
+            if pairs:
+                current_price = float(pairs[0].get("priceUsd", 0) or 0)
+            else:
+                current_price = 0
+        except Exception:
+            current_price = 0
+
+        time_since_exit = now - exit_time
+
+        # Store as the appropriate checkpoint
+        # We check once after 10 min, and fill all three at once using snapshot data
+        with get_db() as db:
+            # Get snapshots near the exit time checkpoints
+            p2 = p5 = p10 = 0
+            for offset_sec, col in [(120, "price_2min_after_exit"), (300, "price_5min_after_exit"), (600, "price_10min_after_exit")]:
+                target_ts = exit_time + offset_sec
+                row = db.execute("""
+                    SELECT price FROM snapshots WHERE token_address=?
+                    AND ts BETWEEN ? AND ? ORDER BY ABS(ts - ?) LIMIT 1
+                """, (addr, target_ts - 15, target_ts + 15, target_ts)).fetchone()
+                if row and row["price"]:
+                    if col == "price_2min_after_exit":
+                        p2 = row["price"]
+                    elif col == "price_5min_after_exit":
+                        p5 = row["price"]
+                    else:
+                        p10 = row["price"]
+
+            # If no snapshot data, use current price for the latest checkpoint
+            if not p10 and current_price:
+                p10 = current_price
+
+            db.execute("""
+                UPDATE shadow_trades SET
+                    price_2min_after_exit=?, price_5min_after_exit=?, price_10min_after_exit=?,
+                    hindsight_checked=1
+                WHERE id=?
+            """, (p2, p5, p10, trade["id"]))
+
+        # Calculate what we would've made/lost
+        pnl_actual = trade["pnl_pct"]
+        if entry_price and p10:
+            pnl_if_held_10 = ((p10 / entry_price) - 1) * 100
+        else:
+            pnl_if_held_10 = 0
+
+        verdict = "GOOD EXIT" if pnl_actual >= pnl_if_held_10 else "LEFT MONEY"
+        logger.info("🔍 Hindsight %s: exited at %+.1f%% (%s) | 10min later: %+.1f%% | %s",
+                     symbol, pnl_actual, trade["exit_reason"], pnl_if_held_10, verdict)
+
+
 # ─── Main Loop ───────────────────────────────────────────────────────────────
 
 def main_loop():
@@ -1071,11 +1167,14 @@ def main_loop():
                 try:
                     grade = evaluate_alert(addr)
                     if grade:
-                        can_open, reason = can_open_position()
-                        if can_open:
-                            open_shadow_position(addr, grade)
+                        if already_traded(addr):
+                            logger.info("⏭️ Skip duplicate: %s (%s) already traded", tok.get("symbol","?"), addr[:8])
                         else:
-                            log_missed_opportunity(addr, grade, reason)
+                            can_open, reason = can_open_position()
+                            if can_open:
+                                open_shadow_position(addr, grade)
+                            else:
+                                log_missed_opportunity(addr, grade, reason)
                 except Exception as e:
                     logger.error("Alert eval %s error: %s", addr[:8], e)
         except Exception as e:
@@ -1126,6 +1225,13 @@ def main_loop():
                 update_missed_outcomes()
         except Exception as e:
             logger.error("Cleanup error: %s", e)
+
+        # 7b. Post-trade hindsight — check closed trades 2min/5min/10min after exit
+        try:
+            if tick_num % 20 == 0:  # every ~60 seconds
+                post_trade_hindsight()
+        except Exception as e:
+            logger.error("Hindsight error: %s", e)
 
         # 8. SOL price + FNG refresh
         try:
@@ -1433,6 +1539,46 @@ def api_waves():
         rows = [dict(r) for r in db.execute(
             "SELECT * FROM tokens ORDER BY detected_at DESC LIMIT ?", (limit,)).fetchall()]
     return jsonify(rows)
+
+
+@app.route("/api/hindsight")
+def api_hindsight():
+    """Show post-trade analysis: did we exit too early or too late?"""
+    with get_db() as db:
+        trades = [dict(r) for r in db.execute("""
+            SELECT symbol, alert_grade, entry_price, exit_price, exit_reason,
+                   pnl_pct, peak_price_during,
+                   price_2min_after_exit, price_5min_after_exit, price_10min_after_exit,
+                   hindsight_checked
+            FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 50
+        """).fetchall()]
+    
+    results = []
+    good_exits = 0
+    left_money = 0
+    for t in trades:
+        entry = t["entry_price"] or 0
+        r = dict(t)
+        if entry and t["price_10min_after_exit"]:
+            r["pnl_if_held_10min"] = ((t["price_10min_after_exit"] / entry) - 1) * 100
+            r["verdict"] = "GOOD_EXIT" if t["pnl_pct"] >= r["pnl_if_held_10min"] else "LEFT_MONEY"
+            if r["verdict"] == "GOOD_EXIT":
+                good_exits += 1
+            else:
+                left_money += 1
+        else:
+            r["pnl_if_held_10min"] = None
+            r["verdict"] = "pending"
+        results.append(r)
+    
+    return jsonify({
+        "trades": results,
+        "summary": {
+            "good_exits": good_exits,
+            "left_money": left_money,
+            "exit_accuracy": f"{good_exits*100/max(good_exits+left_money,1):.0f}%"
+        }
+    })
 
 
 @app.route("/api/export")
