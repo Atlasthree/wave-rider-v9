@@ -1,18 +1,22 @@
 """
-Wave Rider V9.5 - Shadow Trader (Optimized)
-Changes from V9.4:
-  1. Trailing stop 30% -> 15% (no min peak - backtest validated)
-  2. A+B only (C-grade tracked in shadow mode, not traded)
-  3. Unlimited positions (no cap)
-  4. No cooldown between trades
-  5. 1 trade per token address (dedup)
-  6. Glitch log dedup (once per token)
-  7. Full trade logging: contract address + entry filters in trade records
+Wave Rider V9.6 - Reality Mirror Shadow Trader
+Changes from V9.5:
+  1. Progressive exit ladder: 3%@+100, 3%@+200, 10%@+500, 25%@+1500, 35%@+5000 (24% rides TS)
+  2. Re-entry after profitable hard exit (gain >+50%), max 2 trades per token
+  3. Min liquidity gate: $15,000 (skip entry if liq < $15K)
+  4. Hard exit extended: 15min (was 11min)
+  5. Reality mode: 12% buy/sell slippage, 15% TX failure sim, liq exit = -100%
+  6. Circuit breakers: -1 SOL daily, 5 consecutive loss pause, -0.5 SOL hourly
+  7. Force price fetch every tick for ALL open positions
+  8. Track peak for missed opportunities
+  9. Two P&L lines: shadow_pnl (old 3% slippage) + realistic_pnl (12% slippage)
+  10. Improved hindsight: track post-exit for re-entry candidates
 """
 
 import json
 import logging
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -25,7 +29,7 @@ from flask import Flask, jsonify, request, g
 
 # --- Constants ---------------------------------------------------------------
 
-VERSION = "v9.5-shadow"
+VERSION = "v9.6-reality"
 HELIUS_KEY = "6ac59b75-262f-4f22-ae79-749c4bcefdc2"
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
 HELIUS_API = f"https://api.helius.xyz/v0"
@@ -39,13 +43,22 @@ FNG_URL = "https://api.alternative.me/fng/?limit=1"
 FIRST_MINUTE_SECS = 65
 EXTENDED_MONITOR_SECS = 600
 POSITION_SIZE_SOL = 0.1
-BUY_SLIPPAGE = 0.03
-SELL_SLIPPAGE = 0.03
+
+# Shadow slippage (old-style, for shadow_pnl)
+SHADOW_BUY_SLIPPAGE = 0.03
+SHADOW_SELL_SLIPPAGE = 0.03
+
+# Reality slippage (for realistic_pnl)
+REALITY_BUY_SLIPPAGE = 0.12
+REALITY_SELL_SLIPPAGE = 0.12
+
+# TX failure simulation rate
+TX_FAILURE_RATE = 0.15
+
 TRAILING_STOP_PCT = 15
 STOP_LOSS_PCT = 30
-TAKE_PROFIT_1_PCT = 50
-HARD_EXIT_SECONDS = 660
-MAX_HOLD_SECONDS = 660
+HARD_EXIT_SECONDS = 900  # 15 min (was 660)
+MAX_HOLD_SECONDS = 900
 EMERGENCY_LIQ_DROP_PCT = 30
 ALERT_SECOND = 35
 HUMAN_DELAY = 5
@@ -53,6 +66,28 @@ CLEANUP_AGE_HOURS = 24
 LOG_MAX_LINES = 200
 DB_PATH = os.environ.get("DB_PATH", "wave_rider_v9.db")
 TICK_INTERVAL = 3
+
+# Min liquidity gate
+MIN_LIQUIDITY_USD = 15000
+
+# Progressive exit ladder
+PROGRESSIVE_LADDER = [
+    (100, 0.03),   # +100%: sell 3%
+    (200, 0.03),   # +200%: sell 3%
+    (500, 0.10),   # +500%: sell 10%
+    (1500, 0.25),  # +1500%: sell 25%
+    (5000, 0.35),  # +5000%: sell 35%
+]
+# Remaining 24% rides with trailing stop
+
+# Re-entry config
+MAX_TRADES_PER_TOKEN = 2
+REENTRY_MIN_GAIN_PCT = 50  # only re-enter if first trade exited with > +50%
+
+# Circuit breakers
+DAILY_LOSS_LIMIT_SOL = -1.0
+HOURLY_LOSS_LIMIT_SOL = -0.5
+CONSECUTIVE_LOSS_PAUSE = 5
 
 # --- Logging -----------------------------------------------------------------
 
@@ -88,8 +123,17 @@ state = {
     "started": False,
     "tick_count": 0,
     "start_time": 0,
-    "traded_addresses": set(),
+    "traded_addresses": {},  # addr -> trade_count (was set, now dict for re-entry)
     "glitch_logged": set(),
+    # Circuit breaker state
+    "daily_pnl": 0.0,
+    "hourly_pnl": 0.0,
+    "hourly_reset_time": 0,
+    "consecutive_losses": 0,
+    "circuit_breaker_active": False,
+    "circuit_breaker_reason": "",
+    # Re-entry candidates
+    "reentry_candidates": {},  # addr -> {grade, exit_gain_pct, exit_time, ...}
 }
 
 # --- Database ----------------------------------------------------------------
@@ -140,19 +184,26 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     token_address TEXT, symbol TEXT,
     alert_grade TEXT,
+    trade_number INTEGER DEFAULT 1,
     entry_time REAL, entry_price REAL, entry_liquidity REAL,
     entry_filters TEXT DEFAULT '',
     position_size_sol REAL DEFAULT 0.1,
-    sold_25_at REAL DEFAULT 0, sold_25_price REAL DEFAULT 0, sold_25_time REAL DEFAULT 0,
+    progressive_sold TEXT DEFAULT '[]',
+    progressive_banked_sol REAL DEFAULT 0,
+    remaining_pct REAL DEFAULT 1.0,
     exit_time REAL DEFAULT 0, exit_price REAL DEFAULT 0,
     exit_reason TEXT DEFAULT '',
+    shadow_pnl_sol REAL DEFAULT 0,
+    realistic_pnl_sol REAL DEFAULT 0,
     pnl_sol REAL DEFAULT 0, pnl_pct REAL DEFAULT 0,
     peak_price_during REAL DEFAULT 0,
     status TEXT DEFAULT 'open',
+    tx_failure_simulated INTEGER DEFAULT 0,
     price_2min_after_exit REAL DEFAULT 0,
     price_5min_after_exit REAL DEFAULT 0,
     price_10min_after_exit REAL DEFAULT 0,
-    hindsight_checked INTEGER DEFAULT 0
+    hindsight_checked INTEGER DEFAULT 0,
+    reentry_candidate INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS missed_opportunities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,10 +223,26 @@ def init_db():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
-    try:
-        conn.execute("SELECT entry_filters FROM shadow_trades LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE shadow_trades ADD COLUMN entry_filters TEXT DEFAULT ''")
+    # Migration: add new columns if upgrading from V9.5
+    migrations = [
+        ("shadow_trades", "trade_number", "INTEGER DEFAULT 1"),
+        ("shadow_trades", "progressive_sold", "TEXT DEFAULT '[]'"),
+        ("shadow_trades", "progressive_banked_sol", "REAL DEFAULT 0"),
+        ("shadow_trades", "remaining_pct", "REAL DEFAULT 1.0"),
+        ("shadow_trades", "shadow_pnl_sol", "REAL DEFAULT 0"),
+        ("shadow_trades", "realistic_pnl_sol", "REAL DEFAULT 0"),
+        ("shadow_trades", "tx_failure_simulated", "INTEGER DEFAULT 0"),
+        ("shadow_trades", "reentry_candidate", "INTEGER DEFAULT 0"),
+        ("shadow_trades", "entry_filters", "TEXT DEFAULT ''"),
+    ]
+    for table, col, coltype in migrations:
+        try:
+            conn.execute(f"SELECT {col} FROM {table} LIMIT 1")
+        except sqlite3.OperationalError:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
     conn.close()
     logger.info("DB initialized: %s", DB_PATH)
 
@@ -195,7 +262,7 @@ def get_db():
 # --- HTTP helpers ------------------------------------------------------------
 
 sess = requests.Session()
-sess.headers.update({"User-Agent": "WaveRider/9.5"})
+sess.headers.update({"User-Agent": "WaveRider/9.6"})
 
 
 def safe_get(url, timeout=8, params=None):
@@ -373,6 +440,7 @@ def collect_price_snapshots():
                         active.append(addr)
                     elif now - last_snap >= 120:
                         active.append(addr)
+        # V9.6: Force price fetch for ALL open positions every tick
         for addr in state["open_positions"]:
             if addr not in active:
                 active.append(addr)
@@ -624,7 +692,6 @@ def evaluate_alert(addr):
         current_gain = tok.get("current_gain_pct", 0)
         creator_prev = tok.get("creator_prev_tokens", -1)
         liq = tok.get("current_liquidity", 0)
-        hour = tok.get("graduation_hour", 12)
         symbol = tok.get("symbol", "???")
 
     entry_filters = {}
@@ -683,41 +750,110 @@ def evaluate_alert(addr):
             VALUES (?,?,?,?,?,?,?,?)""",
             (addr, symbol, ts, grade, entry_filters_json, json.dumps(safety_checks), current_price, "pending"))
 
-    logger.info("ALERT %s-grade: %s (%s) price=$%.6f gain=%.1f%%",
-                grade, symbol, addr[:8], current_price, current_gain)
+    logger.info("ALERT %s-grade: %s (%s) price=$%.6f gain=%.1f%% liq=$%.0f",
+                grade, symbol, addr[:8], current_price, current_gain, liq)
     return grade, entry_filters_json
+
+
+# --- Circuit Breakers --------------------------------------------------------
+
+def check_circuit_breaker():
+    """Check if circuit breakers are tripped. Returns (active, reason)."""
+    with state_lock:
+        now = time.time()
+        # Reset hourly counter
+        if now - state["hourly_reset_time"] > 3600:
+            state["hourly_pnl"] = 0.0
+            state["hourly_reset_time"] = now
+
+        if state["daily_pnl"] <= DAILY_LOSS_LIMIT_SOL:
+            state["circuit_breaker_active"] = True
+            state["circuit_breaker_reason"] = f"Daily loss limit hit: {state['daily_pnl']:+.4f} SOL"
+            return True, state["circuit_breaker_reason"]
+
+        if state["hourly_pnl"] <= HOURLY_LOSS_LIMIT_SOL:
+            state["circuit_breaker_active"] = True
+            state["circuit_breaker_reason"] = f"Hourly loss limit hit: {state['hourly_pnl']:+.4f} SOL"
+            return True, state["circuit_breaker_reason"]
+
+        if state["consecutive_losses"] >= CONSECUTIVE_LOSS_PAUSE:
+            state["circuit_breaker_active"] = True
+            state["circuit_breaker_reason"] = f"Consecutive loss streak: {state['consecutive_losses']}"
+            return True, state["circuit_breaker_reason"]
+
+        state["circuit_breaker_active"] = False
+        state["circuit_breaker_reason"] = ""
+        return False, ""
+
+
+def update_circuit_breaker_pnl(pnl_sol):
+    """Update circuit breaker counters after a trade closes."""
+    with state_lock:
+        state["daily_pnl"] += pnl_sol
+        state["hourly_pnl"] += pnl_sol
+        if pnl_sol < 0:
+            state["consecutive_losses"] += 1
+        else:
+            state["consecutive_losses"] = 0
 
 
 # --- Shadow Trading Engine ---------------------------------------------------
 
-def already_traded(addr):
+def get_trade_count(addr):
+    """Get number of trades already done for this token."""
     with state_lock:
-        if addr in state["traded_addresses"]:
-            return True
-        if addr in state["open_positions"]:
-            return True
-    with get_db() as db:
-        row = db.execute("SELECT COUNT(*) as c FROM shadow_trades WHERE token_address=?", (addr,)).fetchone()
-        if row["c"] > 0:
-            with state_lock:
-                state["traded_addresses"].add(addr)
-            return True
-    return False
+        count = state["traded_addresses"].get(addr, 0)
+    if count == 0:
+        with get_db() as db:
+            row = db.execute("SELECT COUNT(*) as c FROM shadow_trades WHERE token_address=?", (addr,)).fetchone()
+            count = row["c"]
+            if count > 0:
+                with state_lock:
+                    state["traded_addresses"][addr] = count
+    return count
 
 
-def open_shadow_position(addr, grade, entry_filters_json=""):
+def can_trade(addr, is_reentry=False):
+    """Check if we can trade this token (respects max trades per token)."""
+    count = get_trade_count(addr)
+    if is_reentry:
+        return count < MAX_TRADES_PER_TOKEN
+    else:
+        return count == 0
+
+
+def open_shadow_position(addr, grade, entry_filters_json="", is_reentry=False):
     with state_lock:
         tok = state["tokens"].get(addr)
         if not tok:
             return
-        tok["shadow_entry_scheduled"] = True
-        tok["_entry_filters_json"] = entry_filters_json
+        if not is_reentry:
+            tok["shadow_entry_scheduled"] = True
+            tok["_entry_filters_json"] = entry_filters_json
         symbol = tok.get("symbol", "???")
+        liq = tok.get("current_liquidity", 0)
 
-    logger.info("Shadow BUY scheduled: %s (%s) grade=%s at t+40s", symbol, addr[:8], grade)
+    # V9.6: Min liquidity gate
+    if liq < MIN_LIQUIDITY_USD and liq > 0:
+        log_missed_opportunity(addr, grade, f"low_liq_${liq:.0f}")
+        logger.info("Skip %s: liq=$%.0f < $%d minimum", symbol, liq, MIN_LIQUIDITY_USD)
+        return
+
+    tag = "RE-ENTRY" if is_reentry else "BUY"
+    logger.info("Shadow %s scheduled: %s (%s) grade=%s liq=$%.0f", tag, symbol, addr[:8], grade, liq)
+
+    if is_reentry:
+        # For re-entries, execute immediately (no delay)
+        execute_shadow_entry(addr, is_reentry=True, grade_override=grade)
 
 
-def execute_shadow_entry(addr):
+def execute_shadow_entry(addr, is_reentry=False, grade_override=None):
+    # Check circuit breaker
+    cb_active, cb_reason = check_circuit_breaker()
+    if cb_active:
+        logger.warning("CIRCUIT BREAKER active, skipping entry: %s", cb_reason)
+        return
+
     with state_lock:
         tok = state["tokens"].get(addr)
         if not tok:
@@ -730,42 +866,69 @@ def execute_shadow_entry(addr):
     if not price:
         return
 
-    entry_price = price * (1 + BUY_SLIPPAGE)
+    # V9.6: Min liq gate check at execution time too
+    if liq < MIN_LIQUIDITY_USD and liq > 0:
+        logger.info("Skip entry %s at exec: liq=$%.0f < $%d", symbol, liq, MIN_LIQUIDITY_USD)
+        return
+
+    # V9.6: TX failure simulation
+    tx_failed = random.random() < TX_FAILURE_RATE
+    if tx_failed:
+        logger.info("TX FAILURE simulated for %s (%.0f%% chance)", symbol, TX_FAILURE_RATE * 100)
+
+    # Shadow entry price (3% slippage)
+    shadow_entry_price = price * (1 + SHADOW_BUY_SLIPPAGE)
+    # Reality entry price (12% slippage)
+    reality_entry_price = price * (1 + REALITY_BUY_SLIPPAGE)
+
     ts = time.time()
 
-    grade = "C"
-    with get_db() as db:
-        row = db.execute("SELECT grade, entry_filters FROM alerts WHERE token_address=? ORDER BY ts DESC LIMIT 1", (addr,)).fetchone()
-        if row:
-            grade = row["grade"]
-            if not entry_filters_json:
-                entry_filters_json = row["entry_filters"] or ""
+    grade = grade_override or "C"
+    if not grade_override:
+        with get_db() as db:
+            row = db.execute("SELECT grade, entry_filters FROM alerts WHERE token_address=? ORDER BY ts DESC LIMIT 1", (addr,)).fetchone()
+            if row:
+                grade = row["grade"]
+                if not entry_filters_json:
+                    entry_filters_json = row["entry_filters"] or ""
+
+    trade_number = get_trade_count(addr) + 1
 
     with get_db() as db:
         db.execute("""INSERT INTO shadow_trades
-            (token_address,symbol,alert_grade,entry_time,entry_price,entry_liquidity,
-             entry_filters,position_size_sol,peak_price_during,status)
-            VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (addr, symbol, grade, ts, entry_price, liq,
-             entry_filters_json, POSITION_SIZE_SOL, entry_price, "open"))
+            (token_address,symbol,alert_grade,trade_number,entry_time,entry_price,entry_liquidity,
+             entry_filters,position_size_sol,peak_price_during,status,
+             remaining_pct,progressive_sold,progressive_banked_sol,tx_failure_simulated)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (addr, symbol, grade, trade_number, ts, shadow_entry_price, liq,
+             entry_filters_json, POSITION_SIZE_SOL, shadow_entry_price, "open",
+             1.0, "[]", 0.0, 1 if tx_failed else 0))
         trade_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     with state_lock:
         state["open_positions"][addr] = {
             "trade_id": trade_id,
-            "entry_price": entry_price,
+            "entry_price": shadow_entry_price,
+            "reality_entry_price": reality_entry_price,
             "entry_time": ts,
             "entry_liquidity": liq,
             "position_size_sol": POSITION_SIZE_SOL,
-            "sold_25": False,
-            "peak_price": entry_price,
+            "peak_price": shadow_entry_price,
             "symbol": symbol,
             "grade": grade,
+            "trade_number": trade_number,
+            "tx_failed": tx_failed,
+            # Progressive exit tracking
+            "progressive_sold": [],  # list of (threshold_pct, sell_pct, price, sol_banked)
+            "progressive_banked_sol": 0.0,
+            "remaining_pct": 1.0,
         }
-        state["traded_addresses"].add(addr)
+        state["traded_addresses"][addr] = trade_number
 
-    logger.info("Shadow BUY executed: %s @ $%.6f (entry with %.0f%% slippage) liq=$%.0f grade=%s",
-                symbol, entry_price, BUY_SLIPPAGE * 100, liq, grade)
+    tag = f"#{trade_number}" if trade_number > 1 else ""
+    logger.info("Shadow BUY%s executed: %s @ $%.6f (shadow) / $%.6f (reality) liq=$%.0f grade=%s%s",
+                tag, symbol, shadow_entry_price, reality_entry_price, liq, grade,
+                " [TX FAILED]" if tx_failed else "")
 
 
 def manage_shadow_positions():
@@ -788,9 +951,11 @@ def manage_shadow_positions():
         entry_time = pos["entry_time"]
         entry_liq = pos["entry_liquidity"]
         peak = pos["peak_price"]
-        sold_25 = pos["sold_25"]
         trade_id = pos["trade_id"]
         symbol = pos["symbol"]
+        remaining_pct = pos["remaining_pct"]
+        progressive_banked = pos["progressive_banked_sol"]
+        progressive_sold = pos["progressive_sold"]
         age = now - entry_time
         gain_pct = ((current_price / entry_price) - 1) * 100 if entry_price else 0
 
@@ -802,79 +967,196 @@ def manage_shadow_positions():
             with get_db() as db:
                 db.execute("UPDATE shadow_trades SET peak_price_during=? WHERE id=?", (peak, trade_id))
 
+        # V9.6: Progressive exit ladder
+        for threshold_pct, sell_pct in PROGRESSIVE_LADDER:
+            already_sold_this = any(s[0] == threshold_pct for s in progressive_sold)
+            if not already_sold_this and gain_pct >= threshold_pct and remaining_pct > 0.01:
+                actual_sell = min(sell_pct, remaining_pct)
+                sell_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
+                sol_from_sell = POSITION_SIZE_SOL * actual_sell * (sell_price / entry_price)
+                cost_basis = POSITION_SIZE_SOL * actual_sell
+                banked_profit = sol_from_sell - cost_basis
+
+                progressive_sold.append((threshold_pct, actual_sell, sell_price, banked_profit))
+                progressive_banked += banked_profit
+                remaining_pct -= actual_sell
+
+                with state_lock:
+                    if addr in state["open_positions"]:
+                        state["open_positions"][addr]["progressive_sold"] = progressive_sold
+                        state["open_positions"][addr]["progressive_banked_sol"] = progressive_banked
+                        state["open_positions"][addr]["remaining_pct"] = remaining_pct
+
+                with get_db() as db:
+                    db.execute("""UPDATE shadow_trades SET progressive_sold=?, progressive_banked_sol=?,
+                        remaining_pct=? WHERE id=?""",
+                        (json.dumps(progressive_sold), progressive_banked, remaining_pct, trade_id))
+
+                logger.info("PROGRESSIVE SELL %.0f%% of %s at +%.0f%% @ $%.6f | banked=%.4f SOL | remaining=%.0f%%",
+                            actual_sell * 100, symbol, threshold_pct, sell_price, banked_profit, remaining_pct * 100)
+
         exit_reason = ""
         exit_price = 0
 
-        # EMERGENCY: liquidity drop > 30%
+        # EMERGENCY: liquidity drop
         if entry_liq > 0 and current_liq > 0:
             liq_drop = ((entry_liq - current_liq) / entry_liq) * 100
             if liq_drop > EMERGENCY_LIQ_DROP_PCT:
                 exit_reason = f"EMERGENCY_LIQ_DROP_{liq_drop:.0f}pct"
-                exit_price = current_price * (1 - SELL_SLIPPAGE)
+                exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
 
         # Stop loss
         if not exit_reason and gain_pct <= -STOP_LOSS_PCT:
             exit_reason = f"STOP_LOSS_{gain_pct:.1f}pct"
-            exit_price = current_price * (1 - SELL_SLIPPAGE)
+            exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
 
-        # Hard exit at 11 min
+        # Hard exit at 15 min
         if not exit_reason and age >= HARD_EXIT_SECONDS:
             exit_reason = f"HARD_EXIT_{age:.0f}s"
-            exit_price = current_price * (1 - SELL_SLIPPAGE)
+            exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
 
         # Max hold
         if not exit_reason and age >= MAX_HOLD_SECONDS:
             exit_reason = f"MAX_HOLD_{age:.0f}s"
-            exit_price = current_price * (1 - SELL_SLIPPAGE)
+            exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
 
-        # Take profit 25% at +50%
-        if not exit_reason and not sold_25 and gain_pct >= TAKE_PROFIT_1_PCT:
-            sell_price = current_price * (1 - SELL_SLIPPAGE)
-            partial_sol = POSITION_SIZE_SOL * 0.25
-            partial_pnl = partial_sol * (gain_pct / 100)
-            with state_lock:
-                if addr in state["open_positions"]:
-                    state["open_positions"][addr]["sold_25"] = True
-            with get_db() as db:
-                db.execute("UPDATE shadow_trades SET sold_25_at=?,sold_25_price=?,sold_25_time=? WHERE id=?",
-                           (sell_price, current_price, now, trade_id))
-            logger.info("Shadow SELL 25%%: %s @ $%.6f (+%.1f%%) partial_pnl=%.4f SOL",
-                        symbol, sell_price, gain_pct, partial_pnl)
-            sold_25 = True
-
-        # Trailing stop at 15% from peak
+        # Trailing stop at 15% from peak (on remaining position)
         if not exit_reason and peak > entry_price:
             drop_from_peak = ((peak - current_price) / peak) * 100
             if drop_from_peak >= TRAILING_STOP_PCT:
                 exit_reason = f"TRAILING_STOP_{drop_from_peak:.1f}pct_from_peak"
-                exit_price = current_price * (1 - SELL_SLIPPAGE)
+                exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
 
         if exit_reason:
             if not exit_price:
-                exit_price = current_price * (1 - SELL_SLIPPAGE)
-            remaining_pct = 0.75 if sold_25 else 1.0
-            remaining_sol = POSITION_SIZE_SOL * remaining_pct
-            pnl_remaining = remaining_sol * ((exit_price / entry_price) - 1) if entry_price else 0
-            partial_pnl = 0
-            if sold_25:
-                with get_db() as db:
-                    row = db.execute("SELECT sold_25_at FROM shadow_trades WHERE id=?", (trade_id,)).fetchone()
-                    if row and row["sold_25_at"]:
-                        partial_pnl = POSITION_SIZE_SOL * 0.25 * ((row["sold_25_at"] / entry_price) - 1)
-            total_pnl = pnl_remaining + partial_pnl
-            total_pnl_pct = (total_pnl / POSITION_SIZE_SOL) * 100
+                exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
+
+            # Shadow PnL (old-style 3% slippage on remaining)
+            remaining_exit_pnl = POSITION_SIZE_SOL * remaining_pct * ((exit_price / entry_price) - 1) if entry_price else 0
+            shadow_pnl = progressive_banked + remaining_exit_pnl
+
+            # Reality PnL (12% slippage)
+            reality_entry = pos.get("reality_entry_price", entry_price)
+            is_liq_exit = "EMERGENCY_LIQ" in exit_reason
+            tx_failed = pos.get("tx_failed", False)
+
+            if tx_failed:
+                # TX failed at entry, no position opened, no gain no loss (just lost gas)
+                realistic_pnl = -0.005  # ~gas cost
+            elif is_liq_exit:
+                # V9.6: Liq exit with reality slippage
+                # If liq dropped to near 0, sell would fail -> -100% on remaining
+                if current_liq < 100:  # effectively zero liquidity
+                    realistic_remaining = -POSITION_SIZE_SOL * remaining_pct  # total loss on remaining
+                else:
+                    realistic_remaining = POSITION_SIZE_SOL * remaining_pct * ((current_price * (1 - REALITY_SELL_SLIPPAGE) / reality_entry) - 1)
+                # Progressive sells already banked (with reality slippage adjustment)
+                reality_progressive = progressive_banked * (1 - REALITY_SELL_SLIPPAGE) / (1 - SHADOW_SELL_SLIPPAGE) if progressive_banked else 0
+                realistic_pnl = reality_progressive + realistic_remaining
+            else:
+                reality_exit = current_price * (1 - REALITY_SELL_SLIPPAGE)
+                realistic_remaining = POSITION_SIZE_SOL * remaining_pct * ((reality_exit / reality_entry) - 1) if reality_entry else 0
+                reality_progressive = progressive_banked * (1 - REALITY_SELL_SLIPPAGE) / (1 - SHADOW_SELL_SLIPPAGE) if progressive_banked else 0
+                realistic_pnl = reality_progressive + realistic_remaining
+
+            shadow_pnl_pct = (shadow_pnl / POSITION_SIZE_SOL) * 100
+
+            # Check if this is a re-entry candidate (for future re-entry)
+            reentry_candidate = 0
+            if "HARD_EXIT" in exit_reason and shadow_pnl_pct > REENTRY_MIN_GAIN_PCT:
+                reentry_candidate = 1
 
             with get_db() as db:
                 db.execute("""UPDATE shadow_trades SET exit_time=?,exit_price=?,exit_reason=?,
-                    pnl_sol=?,pnl_pct=?,peak_price_during=?,status='closed' WHERE id=?""",
-                    (now, exit_price, exit_reason, total_pnl, total_pnl_pct, peak, trade_id))
+                    pnl_sol=?,pnl_pct=?,shadow_pnl_sol=?,realistic_pnl_sol=?,
+                    peak_price_during=?,status='closed',
+                    remaining_pct=?,progressive_sold=?,progressive_banked_sol=?,
+                    reentry_candidate=? WHERE id=?""",
+                    (now, exit_price, exit_reason, shadow_pnl, shadow_pnl_pct,
+                     shadow_pnl, realistic_pnl, peak, remaining_pct,
+                     json.dumps(progressive_sold), progressive_banked,
+                     reentry_candidate, trade_id))
 
             with state_lock:
                 state["open_positions"].pop(addr, None)
 
-            color = "WIN" if total_pnl >= 0 else "LOSS"
-            logger.info("%s Shadow EXIT %s: %s @ $%.6f pnl=%.4f SOL (%.1f%%) reason=%s",
-                        color, symbol, addr[:8], exit_price, total_pnl, total_pnl_pct, exit_reason)
+            # Update circuit breaker with realistic PnL
+            update_circuit_breaker_pnl(realistic_pnl)
+
+            color = "WIN" if shadow_pnl >= 0 else "LOSS"
+            logger.info("%s Shadow EXIT %s: %s pnl=%.4f SOL (%.1f%%) reality=%.4f SOL | %s%s%s",
+                        color, symbol, addr[:8], shadow_pnl, shadow_pnl_pct, realistic_pnl,
+                        exit_reason,
+                        " [TX_FAIL]" if tx_failed else "",
+                        " [REENTRY_CANDIDATE]" if reentry_candidate else "")
+
+            # V9.6: Schedule re-entry if candidate
+            if reentry_candidate and can_trade(addr, is_reentry=True):
+                with state_lock:
+                    grade = pos.get("grade", "B")
+                    state["reentry_candidates"][addr] = {
+                        "grade": grade,
+                        "exit_gain_pct": shadow_pnl_pct,
+                        "exit_time": now,
+                        "symbol": symbol,
+                    }
+                logger.info("RE-ENTRY queued: %s (exited at +%.1f%%, grade=%s)", symbol, shadow_pnl_pct, grade)
+
+
+def process_reentries():
+    """Process pending re-entry candidates."""
+    now = time.time()
+    with state_lock:
+        candidates = dict(state["reentry_candidates"])
+
+    for addr, info in candidates.items():
+        # Wait 5 seconds after exit before re-entering
+        if now - info["exit_time"] < 5:
+            continue
+
+        # Check if still eligible
+        if not can_trade(addr, is_reentry=True):
+            with state_lock:
+                state["reentry_candidates"].pop(addr, None)
+            continue
+
+        # Check if already in a position
+        skip_in_position = False
+        with state_lock:
+            if addr in state["open_positions"]:
+                skip_in_position = True
+        if skip_in_position:
+            continue
+
+        # Check circuit breaker
+        cb_active, _ = check_circuit_breaker()
+        if cb_active:
+            continue
+
+        # Check current price is still moving up
+        skip_no_tok = False
+        liq = 0
+        with state_lock:
+            tok = state["tokens"].get(addr)
+            if not tok:
+                state["reentry_candidates"].pop(addr, None)
+                skip_no_tok = True
+            else:
+                liq = tok.get("current_liquidity", 0)
+        if skip_no_tok:
+            continue
+
+        # Check liq gate
+        if liq < MIN_LIQUIDITY_USD and liq > 0:
+            logger.info("Re-entry skip %s: liq=$%.0f < $%d", info["symbol"], liq, MIN_LIQUIDITY_USD)
+            with state_lock:
+                state["reentry_candidates"].pop(addr, None)
+            continue
+
+        # Execute re-entry
+        open_shadow_position(addr, info["grade"], is_reentry=True)
+        with state_lock:
+            state["reentry_candidates"].pop(addr, None)
 
 
 def log_missed_opportunity(addr, grade, reason):
@@ -1039,6 +1321,7 @@ def main_loop():
     with state_lock:
         state["started"] = True
         state["start_time"] = time.time()
+        state["hourly_reset_time"] = time.time()
 
     while True:
         tick_start = time.time()
@@ -1068,7 +1351,7 @@ def main_loop():
         except Exception as e:
             logger.error("Scan error: %s", e)
 
-        # 2. Price snapshots
+        # 2. Price snapshots (V9.6: forces fetch for all open positions)
         try:
             collect_price_snapshots()
         except Exception as e:
@@ -1102,12 +1385,17 @@ def main_loop():
                     grade = result[0] if result else None
                     entry_filters_json = result[1] if result else ""
                     if grade:
-                        if already_traded(addr):
-                            logger.info("Skip duplicate: %s already traded", tok.get("symbol","?"))
-                        elif grade == "C":
+                        if grade == "C":
                             log_missed_opportunity(addr, grade, "c_grade_shadow_only")
+                        elif not can_trade(addr):
+                            logger.info("Skip duplicate: %s already traded", tok.get("symbol","?"))
                         else:
-                            open_shadow_position(addr, grade, entry_filters_json)
+                            # Check circuit breaker before opening
+                            cb_active, cb_reason = check_circuit_breaker()
+                            if cb_active:
+                                log_missed_opportunity(addr, grade, f"circuit_breaker:{cb_reason[:30]}")
+                            else:
+                                open_shadow_position(addr, grade, entry_filters_json)
                 except Exception as e:
                     logger.error("Alert eval %s error: %s", addr[:8], e)
         except Exception as e:
@@ -1130,6 +1418,10 @@ def main_loop():
                     logger.error("Shadow entry %s error: %s", addr[:8], e)
 
             manage_shadow_positions()
+
+            # V9.6: Process re-entries
+            process_reentries()
+
         except Exception as e:
             logger.error("Shadow trader error: %s", e)
 
@@ -1195,7 +1487,7 @@ def startup():
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Wave Rider V9.5 - Shadow Trader</title>
+<title>Wave Rider V9.6 - Reality Mirror</title>
 <meta http-equiv="refresh" content="10">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1218,12 +1510,14 @@ tr:hover{background:#161b22}
 .empty{color:#484f58;text-align:center;padding:20px}
 .changes{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin-bottom:16px;font-size:11px;color:#8b949e}
 .changes b{color:#58a6ff}
+.cb-active{background:#f8514922;border:1px solid #f85149;border-radius:6px;padding:10px;margin-bottom:16px;color:#f85149;font-weight:700}
 </style></head><body>
-<h1>Wave Rider V9.5 - Shadow Trader</h1>
-<div class="sub">A+B only | TS=15%% | Unlimited slots | Auto-refresh 10s | {{time_utc}}</div>
+<h1>Wave Rider V9.6 - Reality Mirror Shadow Trader</h1>
+<div class="sub">A+B only | TS=15%% | 15min hold | Progressive exit | Re-entry | $15K liq gate | Circuit breakers | {{time_utc}}</div>
 <div class="changes">
-<b>V9.5 changes:</b> TS 30%%->15%% | A+B only (C=shadow) | Unlimited positions | No cooldown | 1 trade/token | Glitch log dedup | Full trade logging
+<b>V9.6 changes:</b> Progressive exit ladder (3%%@+100/3%%@+200/10%%@+500/25%%@+1500/35%%@+5000) | Re-entry after profitable hard exit | $15K min liq | 15min hold (was 11min) | Reality PnL (12%% slippage) | TX failure sim (15%%) | Circuit breakers (-1 SOL daily, 5 streak, -0.5 SOL hourly)
 </div>
+{{circuit_breaker_html}}
 <div class="stats">
 <div class="stat"><div class="label">SOL Price</div><div class="value blue">${{sol_price}}</div></div>
 <div class="stat"><div class="label">FNG</div><div class="value {{fng_color}}">{{fng}}</div></div>
@@ -1231,7 +1525,8 @@ tr:hover{background:#161b22}
 <div class="stat"><div class="label">Open Positions</div><div class="value yellow">{{open_pos}}</div></div>
 <div class="stat"><div class="label">Total Trades</div><div class="value">{{total_trades}}</div></div>
 <div class="stat"><div class="label">Win Rate</div><div class="value {{wr_color}}">{{win_rate}}</div></div>
-<div class="stat"><div class="label">Total P&L</div><div class="value {{pnl_color}}">{{total_pnl}} SOL</div></div>
+<div class="stat"><div class="label">Shadow P&L</div><div class="value {{pnl_color}}">{{total_pnl}} SOL</div></div>
+<div class="stat"><div class="label">Reality P&L</div><div class="value {{rpnl_color}}">{{reality_pnl}} SOL</div></div>
 <div class="stat"><div class="label">Alerts Today</div><div class="value">{{alerts_today}}</div></div>
 <div class="stat"><div class="label">Uptime</div><div class="value">{{uptime}}</div></div>
 </div>
@@ -1259,12 +1554,21 @@ def render_dashboard():
         tracking = len(state["tokens"])
         open_pos = len(state["open_positions"])
         start_time = state["start_time"]
+        cb_active = state["circuit_breaker_active"]
+        cb_reason = state["circuit_breaker_reason"]
+        daily_pnl = state["daily_pnl"]
+        hourly_pnl = state["hourly_pnl"]
+        consec = state["consecutive_losses"]
 
     uptime_s = now - start_time if start_time else 0
     uptime_h = int(uptime_s // 3600)
     uptime_m = int((uptime_s % 3600) // 60)
     uptime = f"{uptime_h}h {uptime_m}m"
     fng_color = "green" if fng >= 60 else ("red" if fng <= 30 else "yellow")
+
+    circuit_breaker_html = ""
+    if cb_active:
+        circuit_breaker_html = f'<div class="cb-active">CIRCUIT BREAKER ACTIVE: {cb_reason} | Daily: {daily_pnl:+.4f} SOL | Hourly: {hourly_pnl:+.4f} SOL | Streak: {consec}</div>'
 
     with get_db() as db:
         closed = db.execute("SELECT * FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC").fetchall()
@@ -1280,28 +1584,34 @@ def render_dashboard():
     wr_color = "green" if total_trades and wins/total_trades > 0.5 else "red" if total_trades else ""
     total_pnl = sum(t["pnl_sol"] for t in closed)
     pnl_color = "green" if total_pnl >= 0 else "red"
+    reality_total = sum((t["realistic_pnl_sol"] or 0) for t in closed)
+    rpnl_color = "green" if reality_total >= 0 else "red"
 
     if open_trades:
         rows = ""
         for t in open_trades:
             with state_lock:
                 tok = state["tokens"].get(t["token_address"], {})
+                pos_data = state["open_positions"].get(t["token_address"], {})
             curr = tok.get("current_price", 0)
             gain = ((curr / t["entry_price"]) - 1) * 100 if t["entry_price"] and curr else 0
             age = now - t["entry_time"]
             pclass = "pnl-pos" if gain >= 0 else "pnl-neg"
             grade_class = f"badge-{t['alert_grade'].lower()}" if t['alert_grade'] else "badge-c"
-            sold = "YES" if t["sold_25_at"] else "-"
+            remaining = pos_data.get("remaining_pct", 1.0)
+            banked = pos_data.get("progressive_banked_sol", 0)
+            trade_num = t.get("trade_number", 1) or 1
+            tag = f" #{trade_num}" if trade_num > 1 else ""
             rows += f"""<tr>
-                <td>{t['symbol']}</td>
+                <td>{t['symbol']}{tag}</td>
                 <td><span class="badge {grade_class}">{t['alert_grade']}</span></td>
                 <td>${t['entry_price']:.6f}</td><td>${curr:.6f}</td>
                 <td class="{pclass}">{gain:+.1f}%</td><td>{age:.0f}s</td>
-                <td>{t['position_size_sol']} SOL</td><td>{sold}</td>
+                <td>{remaining*100:.0f}%</td><td>{banked:+.4f}</td>
                 <td>${t['entry_liquidity']:.0f}</td>
             </tr>"""
         open_table = f"""<table><tr><th>Token</th><th>Grade</th><th>Entry</th><th>Current</th>
-            <th>P&L</th><th>Age</th><th>Size</th><th>25%</th><th>Liq</th></tr>{rows}</table>"""
+            <th>P&L</th><th>Age</th><th>Remaining</th><th>Banked</th><th>Liq</th></tr>{rows}</table>"""
     else:
         open_table = '<div class="empty">No open positions</div>'
 
@@ -1312,16 +1622,21 @@ def render_dashboard():
             grade_class = f"badge-{t['alert_grade'].lower()}" if t['alert_grade'] else "badge-c"
             hold = t["exit_time"] - t["entry_time"] if t["exit_time"] and t["entry_time"] else 0
             ts_str = datetime.fromtimestamp(t["entry_time"], tz=timezone.utc).strftime("%H:%M:%S") if t["entry_time"] else ""
+            rpnl = t["realistic_pnl_sol"] or 0
+            rpclass = "pnl-pos" if rpnl >= 0 else "pnl-neg"
+            trade_num = t.get("trade_number", 1) or 1
+            tag = f" #{trade_num}" if trade_num > 1 else ""
+            reentry = " [RE]" if (t.get("reentry_candidate") or 0) else ""
             rows += f"""<tr>
-                <td>{ts_str}</td><td>{t['symbol']}</td>
+                <td>{ts_str}</td><td>{t['symbol']}{tag}</td>
                 <td><span class="badge {grade_class}">{t['alert_grade']}</span></td>
                 <td>${t['entry_price']:.6f}</td><td>${t['exit_price']:.6f}</td>
                 <td class="{pclass}">{t['pnl_sol']:+.4f}</td>
-                <td class="{pclass}">{t['pnl_pct']:+.1f}%</td>
-                <td>{hold:.0f}s</td><td>{t['exit_reason'][:30]}</td>
+                <td class="{rpclass}">{rpnl:+.4f}</td>
+                <td>{hold:.0f}s</td><td>{t['exit_reason'][:30]}{reentry}</td>
             </tr>"""
         closed_table = f"""<table><tr><th>Time</th><th>Token</th><th>Grade</th><th>Entry</th>
-            <th>Exit</th><th>P&L SOL</th><th>P&L %</th><th>Hold</th><th>Reason</th></tr>{rows}</table>"""
+            <th>Exit</th><th>Shadow P&L</th><th>Reality P&L</th><th>Hold</th><th>Reason</th></tr>{rows}</table>"""
     else:
         closed_table = '<div class="empty">No closed trades yet</div>'
 
@@ -1364,7 +1679,9 @@ def render_dashboard():
                  ("fng_color", fng_color), ("tracking", str(tracking)), ("open_pos", str(open_pos)),
                  ("total_trades", str(total_trades)), ("win_rate", win_rate), ("wr_color", wr_color),
                  ("total_pnl", f"{total_pnl:+.4f}"), ("pnl_color", pnl_color),
+                 ("reality_pnl", f"{reality_total:+.4f}"), ("rpnl_color", rpnl_color),
                  ("alerts_today", str(alerts_today_count)), ("uptime", uptime),
+                 ("circuit_breaker_html", circuit_breaker_html),
                  ("open_table", open_table), ("closed_table", closed_table),
                  ("alerts_table", alerts_table), ("missed_table", missed_table)]:
         html = html.replace("{{" + k + "}}", v)
@@ -1388,6 +1705,9 @@ def health():
             "open_positions": len(state["open_positions"]),
             "tick_count": state["tick_count"],
             "uptime_seconds": time.time() - state["start_time"] if state["start_time"] else 0,
+            "circuit_breaker": state["circuit_breaker_active"],
+            "daily_pnl": state["daily_pnl"],
+            "consecutive_losses": state["consecutive_losses"],
         })
 
 
@@ -1399,11 +1719,13 @@ def api_shadow():
         closed_trades = [dict(r) for r in db.execute(
             "SELECT * FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 50").fetchall()]
         total_pnl = db.execute("SELECT COALESCE(SUM(pnl_sol),0) as s FROM shadow_trades WHERE status='closed'").fetchone()["s"]
+        reality_pnl = db.execute("SELECT COALESCE(SUM(realistic_pnl_sol),0) as s FROM shadow_trades WHERE status='closed'").fetchone()["s"]
         total_closed = db.execute("SELECT COUNT(*) as c FROM shadow_trades WHERE status='closed'").fetchone()["c"]
         wins = db.execute("SELECT COUNT(*) as c FROM shadow_trades WHERE status='closed' AND pnl_sol>0").fetchone()["c"]
     return jsonify({
         "open": open_trades, "closed": closed_trades,
-        "stats": {"total_pnl_sol": total_pnl, "total_trades": total_closed,
+        "stats": {"total_pnl_sol": total_pnl, "reality_pnl_sol": reality_pnl,
+                  "total_trades": total_closed,
                   "wins": wins, "win_rate": (wins / total_closed * 100) if total_closed else 0}
     })
 
@@ -1428,10 +1750,10 @@ def api_waves():
 def api_hindsight():
     with get_db() as db:
         trades_data = [dict(r) for r in db.execute("""
-            SELECT symbol, alert_grade, entry_price, exit_price, exit_reason,
-                   pnl_pct, peak_price_during,
+            SELECT symbol, alert_grade, trade_number, entry_price, exit_price, exit_reason,
+                   pnl_pct, peak_price_during, shadow_pnl_sol, realistic_pnl_sol,
                    price_2min_after_exit, price_5min_after_exit, price_10min_after_exit,
-                   hindsight_checked
+                   hindsight_checked, reentry_candidate
             FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 50
         """).fetchall()]
 
@@ -1476,10 +1798,10 @@ def api_export():
 def logs():
     lines = list(log_buffer)
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-    <title>WR9.5 Logs</title><meta http-equiv="refresh" content="5">
+    <title>WR9.6 Logs</title><meta http-equiv="refresh" content="5">
     <style>body{{background:#0d1117;color:#c9d1d9;font-family:monospace;font-size:12px;padding:16px}}
     pre{{white-space:pre-wrap}}</style></head>
-    <body><h2 style="color:#58a6ff">Wave Rider V9.5 Logs ({len(lines)} lines)</h2>
+    <body><h2 style="color:#58a6ff">Wave Rider V9.6 Logs ({len(lines)} lines)</h2>
     <pre>{"<br>".join(lines[-LOG_MAX_LINES:])}</pre></body></html>"""
     return html, 200, {"Content-Type": "text/html"}
 
