@@ -834,7 +834,7 @@ def open_shadow_position(addr, grade, entry_filters_json="", is_reentry=False):
         liq = tok.get("current_liquidity", 0)
 
     # V9.6: Min liquidity gate
-    if liq < MIN_LIQUIDITY_USD and liq > 0:
+    if liq < MIN_LIQUIDITY_USD:
         log_missed_opportunity(addr, grade, f"low_liq_${liq:.0f}")
         logger.info("Skip %s: liq=$%.0f < $%d minimum", symbol, liq, MIN_LIQUIDITY_USD)
         return
@@ -867,7 +867,7 @@ def execute_shadow_entry(addr, is_reentry=False, grade_override=None):
         return
 
     # V9.6: Min liq gate check at execution time too
-    if liq < MIN_LIQUIDITY_USD and liq > 0:
+    if liq < MIN_LIQUIDITY_USD:
         logger.info("Skip entry %s at exec: liq=$%.0f < $%d", symbol, liq, MIN_LIQUIDITY_USD)
         return
 
@@ -1147,7 +1147,7 @@ def process_reentries():
             continue
 
         # Check liq gate
-        if liq < MIN_LIQUIDITY_USD and liq > 0:
+        if liq < MIN_LIQUIDITY_USD:
             logger.info("Re-entry skip %s: liq=$%.0f < $%d", info["symbol"], liq, MIN_LIQUIDITY_USD)
             with state_lock:
                 state["reentry_candidates"].pop(addr, None)
