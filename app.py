@@ -1584,7 +1584,10 @@ def render_dashboard():
     wr_color = "green" if total_trades and wins/total_trades > 0.5 else "red" if total_trades else ""
     total_pnl = sum(t["pnl_sol"] for t in closed)
     pnl_color = "green" if total_pnl >= 0 else "red"
-    reality_total = sum((t["realistic_pnl_sol"] or 0) for t in closed)
+    try:
+        reality_total = sum((t["realistic_pnl_sol"] or 0) for t in closed)
+    except (KeyError, IndexError):
+        reality_total = 0
     rpnl_color = "green" if reality_total >= 0 else "red"
 
     if open_trades:
@@ -1600,7 +1603,10 @@ def render_dashboard():
             grade_class = f"badge-{t['alert_grade'].lower()}" if t['alert_grade'] else "badge-c"
             remaining = pos_data.get("remaining_pct", 1.0)
             banked = pos_data.get("progressive_banked_sol", 0)
-            trade_num = t.get("trade_number", 1) or 1
+            try:
+                trade_num = t["trade_number"] or 1
+            except (KeyError, IndexError):
+                trade_num = 1
             tag = f" #{trade_num}" if trade_num > 1 else ""
             rows += f"""<tr>
                 <td>{t['symbol']}{tag}</td>
@@ -1622,11 +1628,20 @@ def render_dashboard():
             grade_class = f"badge-{t['alert_grade'].lower()}" if t['alert_grade'] else "badge-c"
             hold = t["exit_time"] - t["entry_time"] if t["exit_time"] and t["entry_time"] else 0
             ts_str = datetime.fromtimestamp(t["entry_time"], tz=timezone.utc).strftime("%H:%M:%S") if t["entry_time"] else ""
-            rpnl = t["realistic_pnl_sol"] or 0
+            try:
+                rpnl = t["realistic_pnl_sol"] or 0
+            except (KeyError, IndexError):
+                rpnl = 0
             rpclass = "pnl-pos" if rpnl >= 0 else "pnl-neg"
-            trade_num = t.get("trade_number", 1) or 1
+            try:
+                trade_num = t["trade_number"] or 1
+            except (KeyError, IndexError):
+                trade_num = 1
             tag = f" #{trade_num}" if trade_num > 1 else ""
-            reentry = " [RE]" if (t.get("reentry_candidate") or 0) else ""
+            try:
+                reentry = " [RE]" if t["reentry_candidate"] else ""
+            except (KeyError, IndexError):
+                reentry = ""
             rows += f"""<tr>
                 <td>{ts_str}</td><td>{t['symbol']}{tag}</td>
                 <td><span class="badge {grade_class}">{t['alert_grade']}</span></td>
