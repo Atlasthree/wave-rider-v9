@@ -1,574 +1,400 @@
 """
-Wave Rider V9.6 - Reality Mirror Shadow Trader
-Changes from V9.5:
-  1. Progressive exit ladder: 3%@+100, 3%@+200, 10%@+500, 25%@+1500, 35%@+5000 (24% rides TS)
-  2. Re-entry after profitable hard exit (gain >+50%), max 2 trades per token
-  3. Min liquidity gate: $15,000 (skip entry if liq < $15K)
-  4. Hard exit extended: 15min (was 11min)
-  5. Reality mode: 12% buy/sell slippage, 15% TX failure sim, liq exit = -100%
-  6. Circuit breakers: -1 SOL daily, 5 consecutive loss pause, -0.5 SOL hourly
-  7. Force price fetch every tick for ALL open positions
-  8. Track peak for missed opportunities
-  9. Two P&L lines: shadow_pnl (old 3% slippage) + realistic_pnl (12% slippage)
-  10. Improved hindsight: track post-exit for re-entry candidates
+Wave Rider Bot v4.4 - V9.6 Entry Filters + Live Execution
+==========================================================
+CHANGES from v4.3:
+- Entry filters now EXACTLY match V9.6 shadow trader logic
+- Bundle detection via Helius REST API (3+ buys in same block)
+- Freeze authority check via getAccountInfo RPC
+- Creator history check (serial deployer detection)
+- Kill signals: curve_dur>300s, price_down>10%, serial creator
+- Entry pass: (momentum + holder_signal + no_kill) OR (top1>=99 + bundle + no_kill)
+- Grading: A (top1>=99+bundle+momentum OR top1>=99+momentum), B (momentum+signal), C (skipped)
+- Single $15K liquidity gate for ALL grades (no A/B distinction)
+- C-grade tokens logged but NOT traded (matches V9.6)
+- All enrichment via async aiohttp (not sync requests)
+- Graceful fallback if Helius enrichment fails
+
+KEPT from v4.3 (all 23 bug fixes + safety):
+- Honeypot check (check_sellable after buy)
+- Halt-aware sells
+- Per-position sell cap (3 attempts)
+- Pool drained check before all sells
+- Zero price tracking
+- Actual on-chain balance check
+- Thread-safe DB with WAL mode
+- Slippage escalation across attempts
+- Balance drop detection
+- No-data timeout exit
+- Progressive ladder sells
+- Circuit breakers
 """
 
-import json
-import logging
 import os
-import random
-import sqlite3
-import threading
+import sys
+import json
 import time
-from collections import deque
-from contextlib import contextmanager
+import base64
+import base58
+import asyncio
+import sqlite3
+import logging
+import traceback
 from datetime import datetime, timezone
+from threading import Lock
+from typing import Optional, Dict, List, Tuple
 
 import requests
-from flask import Flask, jsonify, request, g
+import aiohttp
+from dotenv import load_dotenv
 
-# --- Constants ---------------------------------------------------------------
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+from solders import message as solders_message
 
-VERSION = "v9.6-reality"
-HELIUS_KEY = "53005f0d-1415-494b-8c36-ee3c720c426d"
-HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
-HELIUS_API = f"https://api.helius.xyz/v0"
-DEXSCREENER_BATCH = "https://api.dexscreener.com/latest/dex/tokens"
-PUMPFUN_GRADUATED = "https://frontend-api-v3.pump.fun/coins?sort=created_timestamp&order=DESC&complete=true&includeNsfw=false&limit=50"
-PUMPFUN_LIVE = "https://frontend-api-v3.pump.fun/coins?sort=created_timestamp&order=DESC&complete=false&includeNsfw=false&limit=50"
-GECKOTERMINAL_POOLS = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"
-COINGECKO_SOL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
-FNG_URL = "https://api.alternative.me/fng/?limit=1"
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-FIRST_MINUTE_SECS = 65
-EXTENDED_MONITOR_SECS = 600
-POSITION_SIZE_SOL = 0.1
+load_dotenv()
 
-# Shadow slippage (old-style, for shadow_pnl)
-SHADOW_BUY_SLIPPAGE = 0.03
-SHADOW_SELL_SLIPPAGE = 0.03
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+RPC_URL = os.getenv("RPC_URL", "")
+BALANCE_RPC = "https://api.mainnet-beta.solana.com"
 
-# Reality slippage (for realistic_pnl)
-REALITY_BUY_SLIPPAGE = 0.12
-REALITY_SELL_SLIPPAGE = 0.12
+JUPITER_QUOTE_URL = os.getenv("JUPITER_QUOTE_URL", "https://api.jup.ag/swap/v1/quote")
+JUPITER_SWAP_URL = os.getenv("JUPITER_SWAP_URL", "https://api.jup.ag/swap/v1/swap")
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
 
-# TX failure simulation rate
-TX_FAILURE_RATE = 0.15
+TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TRAILING_STOP_PCT = 15
-STOP_LOSS_PCT = 30
-HARD_EXIT_SECONDS = 900  # 15 min (was 660)
-MAX_HOLD_SECONDS = 900
-EMERGENCY_LIQ_DROP_PCT = 30
-ALERT_SECOND = 35
-HUMAN_DELAY = 5
-CLEANUP_AGE_HOURS = 24
-LOG_MAX_LINES = 200
-DB_PATH = os.environ.get("DB_PATH", "wave_rider_v9.db")
-TICK_INTERVAL = 3
+POSITION_SIZE_SOL = float(os.getenv("POSITION_SIZE_SOL", "0.02"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "200"))  # DATA COLLECTION: high limit
+MAX_TRADES_PER_TOKEN = int(os.getenv("MAX_TRADES_PER_TOKEN", "5"))  # DATA COLLECTION: more re-entries
+HARD_EXIT_SECONDS = int(os.getenv("HARD_EXIT_SECONDS", "900"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "15"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "30"))
 
-# Min liquidity gate
-MIN_LIQUIDITY_USD = 15000
+# Liquidity gate: single $15K for all grades (V9.6 match)
+MIN_LIQ_ENTRY = float(os.getenv("MIN_LIQ_ENTRY", "5000"))  # DATA COLLECTION: loosened to $5K
+MIN_LIQ_ENRICH = float(os.getenv("MIN_LIQ_ENRICH", "5000"))  # DATA COLLECTION: enrich everything $5K+
 
-# Progressive exit ladder
-PROGRESSIVE_LADDER = [
-    (100, 0.03),   # +100%: sell 3%
-    (200, 0.03),   # +200%: sell 3%
-    (500, 0.10),   # +500%: sell 10%
-    (1500, 0.25),  # +1500%: sell 25%
-    (5000, 0.35),  # +5000%: sell 35%
-]
-# Remaining 24% rides with trailing stop
+# Momentum filter
+MIN_MOMENTUM_PCT = float(os.getenv("MIN_MOMENTUM_PCT", "-100"))  # DATA COLLECTION: accept any momentum
 
-# Re-entry config
-MAX_TRADES_PER_TOKEN = 2
-REENTRY_MIN_GAIN_PCT = 50  # only re-enter if first trade exited with > +50%
+EXIT_LADDER_STR = os.getenv("EXIT_LADDER", "100:3,200:3,500:10,1500:25,5000:35")
+EXIT_LADDER = []
+for step in EXIT_LADDER_STR.split(","):
+    threshold, sell_pct = step.split(":")
+    EXIT_LADDER.append((float(threshold), float(sell_pct) / 100))
 
-# Circuit breakers
-DAILY_LOSS_LIMIT_SOL = -1.0
-HOURLY_LOSS_LIMIT_SOL = -0.5
-CONSECUTIVE_LOSS_PAUSE = 5
+MAX_DAILY_LOSS_SOL = float(os.getenv("MAX_DAILY_LOSS_SOL", "999"))  # DATA COLLECTION: no circuit breaker
+MAX_HOURLY_LOSS_SOL = float(os.getenv("MAX_HOURLY_LOSS_SOL", "999"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "999"))
 
-# --- Logging -----------------------------------------------------------------
+LIQ_DROP_THRESHOLD_PCT = float(os.getenv("LIQ_DROP_THRESHOLD_PCT", "30"))
+LIQ_CHECK_INTERVAL_MS = int(os.getenv("LIQ_CHECK_INTERVAL_MS", "400"))
+ENTRY_DELAY_SECONDS = int(os.getenv("ENTRY_DELAY_SECONDS", "15"))  # DATA COLLECTION: faster evaluation
+PRIORITY_FEE_LAMPORTS = int(os.getenv("PRIORITY_FEE_LAMPORTS", "100000"))
 
-log_buffer = deque(maxlen=LOG_MAX_LINES)
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens"
+PUMPFUN_URL = "https://frontend-api-v3.pump.fun/coins?sort=created_timestamp&order=DESC&complete=true&limit=50"
+PUMPFUN_LIVE_URL = "https://frontend-api-v3.pump.fun/coins/currently-live"
+GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"
 
-class BufferHandler(logging.Handler):
-    def emit(self, record):
-        log_buffer.append(self.format(record))
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+HELIUS_API = os.getenv("HELIUS_API", f"https://api.helius.xyz/v0") if HELIUS_API_KEY else ""
 
-logger = logging.getLogger("wr9")
-logger.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-sh = logging.StreamHandler()
-sh.setFormatter(fmt)
-bh = BufferHandler()
-bh.setFormatter(fmt)
-logger.addHandler(sh)
-logger.addHandler(bh)
+SOL_MINT = "So11111111111111111111111111111111111111112"
+LAMPORTS_PER_SOL = 1_000_000_000
+VERSION = "v4.4-prod"
+MAX_EMERGENCY_RETRIES = 3
+MAX_SELL_ATTEMPTS_PER_POSITION = 3  # v4.3: cap sell attempts per position
 
-# --- Shared State ------------------------------------------------------------
+# Shadow mode: True = simulate only, False = real trades
+# Togglable via SHADOW_MODE env var (e.g. SHADOW_MODE=true)
+SHADOW_MODE = os.getenv("SHADOW_MODE", "false").lower() == "true"
 
-state_lock = threading.Lock()
-state = {
-    "sol_price": 0.0,
-    "fng": 0,
-    "last_sol_refresh": 0,
-    "last_fng_refresh": 0,
-    "last_graduated_poll": 0,
-    "last_live_poll": 0,
-    "last_gecko_poll": 0,
-    "tokens": {},
-    "open_positions": {},
-    "started": False,
-    "tick_count": 0,
-    "start_time": 0,
-    "traded_addresses": {},  # addr -> trade_count (was set, now dict for re-entry)
-    "glitch_logged": set(),
-    # Circuit breaker state
-    "daily_pnl": 0.0,
-    "hourly_pnl": 0.0,
-    "hourly_reset_time": 0,
-    "consecutive_losses": 0,
-    "circuit_breaker_active": False,
-    "circuit_breaker_reason": "",
-    # Re-entry candidates
-    "reentry_candidates": {},  # addr -> {grade, exit_gain_pct, exit_time, ...}
-}
+# ============================================================
+# LIVE SAFETY LIMITS
+# ============================================================
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "999"))  # DATA COLLECTION: unlimited
+MAX_HOURLY_SOL_SPEND = float(os.getenv("MAX_HOURLY_SOL_SPEND", "999"))  # DATA COLLECTION: unlimited (50 trades/hr at 0.02)
+MIN_WALLET_RESERVE_SOL = float(os.getenv("MIN_WALLET_RESERVE_SOL", "0.05"))
+MAX_SELL_FAILURES_BEFORE_HALT = int(os.getenv("MAX_SELL_FAILURES_BEFORE_HALT", "3"))
+LIVE_TEST_MODE = False  # v4.3: Full mode — ladder sells enabled, no position cap
 
-# --- Database ----------------------------------------------------------------
+# ============================================================
+# LOGGING
+# ============================================================
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS tokens (
-    address TEXT PRIMARY KEY,
-    symbol TEXT, name TEXT,
-    detected_at REAL, status TEXT DEFAULT 'collecting',
-    first_price REAL, peak_price REAL, current_price REAL,
-    peak_gain_pct REAL DEFAULT 0, final_gain_pct REAL DEFAULT 0,
-    time_to_peak_seconds REAL DEFAULT 0,
-    pre_participants INTEGER DEFAULT 0, pre_replies INTEGER DEFAULT 0,
-    pre_velocity REAL DEFAULT 0, pre_ath_mcap REAL DEFAULT 0,
-    pre_creator TEXT DEFAULT '',
-    top1_holder_pct REAL DEFAULT 0, top5_holder_pct REAL DEFAULT 0, top10_holder_pct REAL DEFAULT 0,
-    bundle_detected INTEGER DEFAULT -1, bundle_buy_count INTEGER DEFAULT 0,
-    freeze_authority INTEGER DEFAULT -1,
-    mint_authority INTEGER DEFAULT -1,
-    curve_duration_sec REAL DEFAULT 0, graduation_hour INTEGER DEFAULT -1, graduation_dow INTEGER DEFAULT -1,
-    sol_price_at_grad REAL DEFAULT 0, fng_at_grad INTEGER DEFAULT 0,
-    has_website INTEGER DEFAULT 0, has_twitter INTEGER DEFAULT 0, has_telegram INTEGER DEFAULT 0,
-    creator_prev_tokens INTEGER DEFAULT -1,
-    dex_source TEXT DEFAULT 'unknown',
-    wave_type TEXT DEFAULT '', snapshot_count INTEGER DEFAULT 0,
-    initial_liquidity REAL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token_address TEXT, ts REAL, price REAL, liquidity_usd REAL,
-    volume_5m REAL, fdv REAL, mcap REAL
-);
-CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token_address TEXT, ts REAL, direction TEXT,
-    sol_amount REAL, block_slot INTEGER, signer TEXT
-);
-CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token_address TEXT, symbol TEXT, ts REAL,
-    grade TEXT,
-    entry_filters TEXT,
-    safety_checks TEXT,
-    price_at_alert REAL,
-    action TEXT DEFAULT 'pending'
-);
-CREATE TABLE IF NOT EXISTS shadow_trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token_address TEXT, symbol TEXT,
-    alert_grade TEXT,
-    trade_number INTEGER DEFAULT 1,
-    entry_time REAL, entry_price REAL, entry_liquidity REAL,
-    entry_filters TEXT DEFAULT '',
-    position_size_sol REAL DEFAULT 0.1,
-    progressive_sold TEXT DEFAULT '[]',
-    progressive_banked_sol REAL DEFAULT 0,
-    remaining_pct REAL DEFAULT 1.0,
-    exit_time REAL DEFAULT 0, exit_price REAL DEFAULT 0,
-    exit_reason TEXT DEFAULT '',
-    shadow_pnl_sol REAL DEFAULT 0,
-    realistic_pnl_sol REAL DEFAULT 0,
-    pnl_sol REAL DEFAULT 0, pnl_pct REAL DEFAULT 0,
-    peak_price_during REAL DEFAULT 0,
-    status TEXT DEFAULT 'open',
-    tx_failure_simulated INTEGER DEFAULT 0,
-    price_2min_after_exit REAL DEFAULT 0,
-    price_5min_after_exit REAL DEFAULT 0,
-    price_10min_after_exit REAL DEFAULT 0,
-    hindsight_checked INTEGER DEFAULT 0,
-    reentry_candidate INTEGER DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS missed_opportunities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token_address TEXT, symbol TEXT, ts REAL,
-    alert_grade TEXT, reason TEXT,
-    peak_gain_pct REAL DEFAULT 0, final_gain_pct REAL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_snapshots_addr ON snapshots(token_address);
-CREATE INDEX IF NOT EXISTS idx_trades_addr ON trades(token_address);
-CREATE INDEX IF NOT EXISTS idx_alerts_action ON alerts(action);
-CREATE INDEX IF NOT EXISTS idx_shadow_status ON shadow_trades(status);
-"""
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot.log", mode="a"),
+    ],
+)
+log = logging.getLogger("wave-rider")
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+# ============================================================
+# HELIUS CREDIT TRACKER
+# ============================================================
+
+class HeliusTracker:
+    """Track Helius API credit usage."""
+    def __init__(self):
+        self.calls_today = 0
+        self.calls_this_hour = 0
+        self.last_hour_reset = time.time()
+        self.last_day_reset = time.time()
+    
+    def record_call(self):
+        now = time.time()
+        if now - self.last_hour_reset > 3600:
+            self.calls_this_hour = 0
+            self.last_hour_reset = now
+        if now - self.last_day_reset > 86400:
+            self.calls_today = 0
+            self.last_day_reset = now
+        self.calls_today += 1
+        self.calls_this_hour += 1
+    
+    def status(self) -> dict:
+        return {
+            "today": self.calls_today,
+            "this_hour": self.calls_this_hour,
+            "est_monthly": self.calls_today * 30,
+        }
+
+helius_tracker = HeliusTracker()
+
+# ============================================================
+# LIVE SAFETY TRACKER
+# ============================================================
+
+class SafetyTracker:
+    """Track spending, failures, and enforce safety limits."""
+    def __init__(self):
+        self.trades_today = 0
+        self.sol_spent_this_hour = 0
+        self.sell_failures = 0
+        self.last_hour_reset = time.time()
+        self.last_day_reset = time.time()
+        self.halted = False
+        self.halt_reason = ""
+    
+    def reset_hourly(self):
+        now = time.time()
+        if now - self.last_hour_reset > 3600:
+            self.sol_spent_this_hour = 0
+            self.last_hour_reset = now
+    
+    def reset_daily(self):
+        now = time.time()
+        if now - self.last_day_reset > 86400:
+            self.trades_today = 0
+            self.last_day_reset = now
+    
+    def can_trade(self) -> Tuple[bool, str]:
+        """Check all safety limits before trading."""
+        self.reset_hourly()
+        self.reset_daily()
+        
+        if self.halted:
+            return False, f"HALTED: {self.halt_reason}"
+        if self.trades_today >= MAX_DAILY_TRADES:
+            return False, f"Daily trade limit ({MAX_DAILY_TRADES})"
+        if self.sol_spent_this_hour >= MAX_HOURLY_SOL_SPEND:
+            return False, f"Hourly SOL limit ({MAX_HOURLY_SOL_SPEND})"
+        return True, ""
+    
+    def record_buy(self, sol_amount: float):
+        self.trades_today += 1
+        self.sol_spent_this_hour += sol_amount
+    
+    def record_sell_failure(self):
+        self.sell_failures += 1
+        if self.sell_failures >= MAX_SELL_FAILURES_BEFORE_HALT:
+            self.halted = True
+            self.halt_reason = f"Sell failed {self.sell_failures} times - FULL STOP"
+            log.error(f"SAFETY HALT: {self.halt_reason}")
+            tg_send(f"SAFETY HALT: {self.halt_reason}\nBot stopped trading. Manual restart needed.")
+    
+    def record_sell_success(self):
+        self.sell_failures = 0  # Reset on success
+    
+    def status(self) -> dict:
+        return {
+            "trades_today": self.trades_today,
+            "sol_spent_hour": round(self.sol_spent_this_hour, 4),
+            "sell_failures": self.sell_failures,
+            "halted": self.halted,
+            "halt_reason": self.halt_reason,
+        }
+
+safety_tracker = SafetyTracker()
+
+# ============================================================
+# RAW RPC HELPERS
+# ============================================================
+
+# Persistent aiohttp session for RPC calls — initialized in bot start()
+_rpc_session: Optional[aiohttp.ClientSession] = None
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.executescript(SCHEMA)
-    # Migration: add new columns if upgrading from V9.5
-    migrations = [
-        ("shadow_trades", "trade_number", "INTEGER DEFAULT 1"),
-        ("shadow_trades", "progressive_sold", "TEXT DEFAULT '[]'"),
-        ("shadow_trades", "progressive_banked_sol", "REAL DEFAULT 0"),
-        ("shadow_trades", "remaining_pct", "REAL DEFAULT 1.0"),
-        ("shadow_trades", "shadow_pnl_sol", "REAL DEFAULT 0"),
-        ("shadow_trades", "realistic_pnl_sol", "REAL DEFAULT 0"),
-        ("shadow_trades", "tx_failure_simulated", "INTEGER DEFAULT 0"),
-        ("shadow_trades", "reentry_candidate", "INTEGER DEFAULT 0"),
-        ("shadow_trades", "entry_filters", "TEXT DEFAULT ''"),
-    ]
-    for table, col, coltype in migrations:
+async def _get_rpc_session() -> aiohttp.ClientSession:
+    """Get or create the persistent RPC aiohttp session."""
+    global _rpc_session
+    if _rpc_session is None or _rpc_session.closed:
+        _rpc_session = aiohttp.ClientSession()
+    return _rpc_session
+
+
+async def close_rpc_session():
+    """Close the persistent RPC session (call on bot stop)."""
+    global _rpc_session
+    if _rpc_session and not _rpc_session.closed:
+        await _rpc_session.close()
+        _rpc_session = None
+
+
+async def rpc_call(method: str, params: list, rpc_url: str = None) -> dict:
+    url = rpc_url or RPC_URL
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    try:
+        session = await _get_rpc_session()
+        async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            data = await resp.json()
+            if rpc_url and HELIUS_API_KEY and HELIUS_API_KEY in (rpc_url or ""):
+                helius_tracker.record_call()
+            return data
+    except Exception as e:
+        log.error(f"RPC {method} failed: {e}")
+        return {}
+
+
+async def get_sol_balance(wallet: str) -> float:
+    data = await rpc_call("getBalance", [wallet], BALANCE_RPC)
+    lamports = data.get("result", {}).get("value", 0)
+    return lamports / LAMPORTS_PER_SOL
+
+
+async def get_token_balance(wallet: str, mint: str) -> int:
+    data = await rpc_call("getTokenAccountsByOwner", [
+        wallet, {"mint": mint}, {"encoding": "jsonParsed"}
+    ], BALANCE_RPC)
+    accounts = data.get("result", {}).get("value", [])
+    if accounts:
         try:
-            conn.execute(f"SELECT {col} FROM {table} LIMIT 1")
-        except sqlite3.OperationalError:
-            try:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
-            except Exception:
-                pass
-    conn.close()
-    logger.info("DB initialized: %s", DB_PATH)
+            return int(accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+        except (KeyError, IndexError):
+            pass
+    return 0
 
 
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# --- HTTP helpers ------------------------------------------------------------
-
-sess = requests.Session()
-sess.headers.update({"User-Agent": "WaveRider/9.6"})
-
-
-def safe_get(url, timeout=8, params=None):
-    try:
-        r = sess.get(url, timeout=timeout, params=params)
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        logger.debug("GET %s failed: %s", url[:80], e)
+async def send_raw_tx(signed_tx_bytes: bytes) -> Optional[str]:
+    encoded = base58.b58encode(signed_tx_bytes).decode()
+    data = await rpc_call("sendTransaction", [encoded, {"skipPreflight": True, "encoding": "base58"}])
+    result = data.get("result")
+    if result:
+        return str(result)
+    log.error(f"sendTransaction error: {data.get('error', {})}")
     return None
 
 
-def safe_post(url, payload, timeout=8):
-    try:
-        r = sess.post(url, json=payload, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code == 429:
-            logger.warning("Rate limited on POST %s", url[:80])
-    except Exception as e:
-        logger.debug("POST %s failed: %s", url[:80], e)
-    return None
+async def confirm_tx(tx_sig: str, timeout_s: int = 30) -> bool:
+    start = time.time()
+    while time.time() - start < timeout_s:
+        data = await rpc_call("getSignatureStatuses", [[tx_sig]])
+        statuses = data.get("result", {}).get("value", [])
+        if statuses and statuses[0]:
+            status = statuses[0]
+            if status.get("err"):
+                log.warning(f"TX {tx_sig[:16]}... FAILED: {status['err']}")
+                return False
+            conf = status.get("confirmationStatus", "")
+            if conf in ("confirmed", "finalized"):
+                log.info(f"TX {tx_sig[:16]}... CONFIRMED ({conf})")
+                return True
+        await asyncio.sleep(0.5)
+    log.warning(f"TX {tx_sig[:16]}... TIMEOUT after {timeout_s}s")
+    return False
 
+# ============================================================
+# TOKEN ENRICHMENT (holder concentration)
+# ============================================================
 
-# --- Data Collection Functions -----------------------------------------------
-
-def poll_graduated():
-    data = safe_get(PUMPFUN_GRADUATED)
-    if not data:
-        return []
-    now = time.time()
-    new_tokens = []
-    for coin in data:
-        addr = coin.get("mint", "")
-        if not addr:
-            continue
-        with state_lock:
-            already_known = addr in state["tokens"]
-        if already_known:
-            continue
-        symbol = coin.get("symbol", "???")
-        name = coin.get("name", "")
-        creator = coin.get("creator", "")
-        created_ts = coin.get("created_timestamp", 0) / 1000.0 if coin.get("created_timestamp") else now
-        curve_dur = now - created_ts if created_ts else 0
-        hour = datetime.now(timezone.utc).hour
-        dow = datetime.now(timezone.utc).weekday()
-        has_web = 1 if coin.get("website") else 0
-        has_tw = 1 if coin.get("twitter") else 0
-        has_tg = 1 if coin.get("telegram") else 0
-        ath_mcap = coin.get("usd_market_cap", 0) or 0
-        token_info = {
-            "detected_at": now, "status": "collecting",
-            "symbol": symbol, "name": name, "pre_creator": creator,
-            "curve_duration_sec": curve_dur, "graduation_hour": hour, "graduation_dow": dow,
-            "has_website": has_web, "has_twitter": has_tw, "has_telegram": has_tg,
-            "pre_ath_mcap": ath_mcap, "dex_source": "pumpfun", "wave_type": "graduated",
-            "alert_evaluated": False, "enriched": False, "shadow_entry_scheduled": False,
-        }
-        with state_lock:
-            token_info["sol_price_at_grad"] = state["sol_price"]
-            token_info["fng_at_grad"] = state["fng"]
-            state["tokens"][addr] = token_info
-        with get_db() as db:
-            db.execute("""INSERT OR IGNORE INTO tokens
-                (address,symbol,name,detected_at,status,pre_creator,curve_duration_sec,
-                 graduation_hour,graduation_dow,has_website,has_twitter,has_telegram,
-                 pre_ath_mcap,dex_source,wave_type,sol_price_at_grad,fng_at_grad)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (addr, symbol, name, now, "collecting", creator, curve_dur,
-                 hour, dow, has_web, has_tw, has_tg, ath_mcap,
-                 "pumpfun", "graduated", token_info["sol_price_at_grad"], token_info["fng_at_grad"]))
-        new_tokens.append(addr)
-    if new_tokens:
-        logger.info("Graduated: +%d tokens", len(new_tokens))
-    return new_tokens
-
-
-def poll_currently_live():
-    data = safe_get(PUMPFUN_LIVE)
-    if not data:
-        return
-    with state_lock:
-        known = set(state["tokens"].keys())
-    updated = 0
-    for coin in data:
-        addr = coin.get("mint", "")
-        if addr not in known:
-            continue
-        participants = coin.get("num_holders", 0) or 0
-        replies = coin.get("reply_count", 0) or 0
-        created_ts = coin.get("created_timestamp", 0) / 1000.0 if coin.get("created_timestamp") else 0
-        velocity = 0
-        if created_ts and participants:
-            age = time.time() - created_ts
-            velocity = participants / max(age, 1)
-        with state_lock:
-            tok = state["tokens"].get(addr)
-            if tok:
-                tok["pre_participants"] = participants
-                tok["pre_replies"] = replies
-                tok["pre_velocity"] = velocity
-        with get_db() as db:
-            db.execute("UPDATE tokens SET pre_participants=?, pre_replies=?, pre_velocity=? WHERE address=?",
-                       (participants, replies, velocity, addr))
-        updated += 1
-    if updated:
-        logger.debug("Live data updated: %d tokens", updated)
-
-
-def poll_geckoterminal():
-    data = safe_get(GECKOTERMINAL_POOLS)
-    if not data or "data" not in data:
-        return []
-    now = time.time()
-    new_tokens = []
-    for pool in data["data"]:
-        attrs = pool.get("attributes", {})
-        rels = pool.get("relationships", {})
-        base = rels.get("base_token", {}).get("data", {}).get("id", "")
-        addr = base.split("_")[-1] if "_" in base else base
-        if not addr or len(addr) < 30:
-            continue
-        with state_lock:
-            already_known = addr in state["tokens"]
-        if already_known:
-            continue
-        name_str = attrs.get("name", "")
-        symbol = name_str.split("/")[0].strip() if "/" in name_str else name_str[:10]
-        dex_id = rels.get("dex", {}).get("data", {}).get("id", "unknown")
-        hour = datetime.now(timezone.utc).hour
-        dow = datetime.now(timezone.utc).weekday()
-        with state_lock:
-            sol = state["sol_price"]
-            fng = state["fng"]
-        token_info = {
-            "detected_at": now, "status": "collecting",
-            "symbol": symbol, "name": name_str, "pre_creator": "",
-            "curve_duration_sec": 0, "graduation_hour": hour, "graduation_dow": dow,
-            "dex_source": dex_id, "wave_type": "gecko_pool",
-            "sol_price_at_grad": sol, "fng_at_grad": fng,
-            "alert_evaluated": False, "enriched": False, "shadow_entry_scheduled": False,
-        }
-        with state_lock:
-            state["tokens"][addr] = token_info
-        with get_db() as db:
-            db.execute("""INSERT OR IGNORE INTO tokens
-                (address,symbol,name,detected_at,status,dex_source,wave_type,
-                 graduation_hour,graduation_dow,sol_price_at_grad,fng_at_grad)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (addr, symbol, name_str, now, "collecting", dex_id, "gecko_pool",
-                 hour, dow, sol, fng))
-        new_tokens.append(addr)
-    if new_tokens:
-        logger.info("GeckoTerminal: +%d pools", len(new_tokens))
-    return new_tokens
-
-
-# --- Price Snapshots ---------------------------------------------------------
-
-def collect_price_snapshots():
-    now = time.time()
-    with state_lock:
-        active = []
-        for addr, tok in state["tokens"].items():
-            if tok["status"] in ("collecting", "first_minute", "extended"):
-                age = now - tok["detected_at"]
-                if age <= FIRST_MINUTE_SECS:
-                    active.append(addr)
-                elif tok["status"] == "extended":
-                    last_snap = tok.get("last_snapshot", 0)
-                    if age < 130 and now - last_snap >= 30:
-                        active.append(addr)
-                    elif age < 310 and now - last_snap >= 60:
-                        active.append(addr)
-                    elif now - last_snap >= 120:
-                        active.append(addr)
-        # V9.6: Force price fetch for ALL open positions every tick
-        for addr in state["open_positions"]:
-            if addr not in active:
-                active.append(addr)
-
-    if not active:
-        return
-
-    for i in range(0, len(active), 30):
-        batch = active[i:i+30]
-        url = f"{DEXSCREENER_BATCH}/{','.join(batch)}"
-        data = safe_get(url, timeout=10)
-        if not data or "pairs" not in data:
-            continue
-        pairs_by_token = {}
-        for pair in data["pairs"]:
-            base_addr = pair.get("baseToken", {}).get("address", "")
-            if base_addr in batch:
-                if base_addr not in pairs_by_token or (pair.get("liquidity", {}).get("usd", 0) or 0) > (pairs_by_token[base_addr].get("liquidity", {}).get("usd", 0) or 0):
-                    pairs_by_token[base_addr] = pair
-        for addr, pair in pairs_by_token.items():
-            price = float(pair.get("priceUsd", 0) or 0)
-            liq = pair.get("liquidity", {}).get("usd", 0) or 0
-            vol = pair.get("volume", {}).get("m5", 0) or 0
-            fdv = pair.get("fdv", 0) or 0
-            mcap = pair.get("marketCap", 0) or 0
-            if price <= 0:
-                continue
-            ts = time.time()
-            price_is_glitch = False
-            with state_lock:
-                tok = state["tokens"].get(addr)
-                if tok:
-                    if not tok.get("first_price"):
-                        tok["first_price"] = price
-                    last_price = tok.get("current_price") or tok.get("first_price")
-                    price_is_glitch = last_price and last_price > 0 and price / last_price > 100
-                    if price_is_glitch:
-                        if addr not in state["glitch_logged"]:
-                            state["glitch_logged"].add(addr)
-                            logger.warning("GLITCH rejected %s: $%.6f -> $%.6f (%.0fx jump)",
-                                           tok.get("symbol", addr[:8]), last_price, price, price / last_price)
-                    else:
-                        tok["current_price"] = price
-                        if price > (tok.get("peak_price") or 0):
-                            tok["peak_price"] = price
-                            tok["time_to_peak_seconds"] = ts - tok["detected_at"]
-                        first_p = tok.get("first_price", price)
-                        tok["peak_gain_pct"] = ((tok.get("peak_price", price) / first_p) - 1) * 100 if first_p else 0
-                        tok["current_gain_pct"] = ((price / first_p) - 1) * 100 if first_p else 0
-                        tok["current_liquidity"] = liq
-                        if not tok.get("initial_liquidity"):
-                            tok["initial_liquidity"] = liq
-                        tok["last_snapshot"] = ts
-                        tok["snapshot_count"] = tok.get("snapshot_count", 0) + 1
-            if not price_is_glitch:
-                with get_db() as db:
-                    db.execute("INSERT INTO snapshots (token_address,ts,price,liquidity_usd,volume_5m,fdv,mcap) VALUES (?,?,?,?,?,?,?)",
-                               (addr, ts, price, liq, vol, fdv, mcap))
-                    db.execute("""UPDATE tokens SET first_price=COALESCE(NULLIF(first_price,0),?),
-                        current_price=?, peak_price=MAX(COALESCE(peak_price,0),?),
-                        initial_liquidity=COALESCE(NULLIF(initial_liquidity,0),?),
-                        snapshot_count=snapshot_count+1 WHERE address=?""",
-                        (price, price, price, liq, addr))
-
-
-# --- Enrichment --------------------------------------------------------------
-
-def fetch_holder_concentration(addr):
-    payload = {
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getTokenLargestAccounts",
-        "params": [addr]
-    }
-    data = safe_post(HELIUS_RPC, payload)
-    if not data or "result" not in data:
+async def fetch_holder_concentration(token_addr: str) -> Optional[dict]:
+    if not HELIUS_RPC:
         return None
-    accounts = data["result"].get("value", [])
+    data = await rpc_call("getTokenLargestAccounts", [token_addr], HELIUS_RPC)
+    if not data or "result" not in data:
+        if "error" in data:
+            log.warning(f"Holder check failed: {str(data.get('error', ''))[:50]}")
+        return None
+    accounts = data.get("result", {}).get("value", [])
     if not accounts:
         return None
-    amounts = sorted([float(a.get("uiAmount", 0) or a.get("amount", 0)) for a in accounts], reverse=True)
+    amounts = sorted(
+        [float(a.get("uiAmount", 0) or a.get("amount", 0)) for a in accounts],
+        reverse=True
+    )
     total = sum(amounts)
     if total <= 0:
         return None
-    top1 = (amounts[0] / total) * 100 if len(amounts) >= 1 else 0
+    top1 = (amounts[0] / total) * 100
     top5 = (sum(amounts[:5]) / total) * 100 if len(amounts) >= 5 else top1
     top10 = (sum(amounts[:10]) / total) * 100 if len(amounts) >= 10 else top5
     return {"top1": top1, "top5": top5, "top10": top10}
 
 
-def fetch_trades_and_bundles(addr):
-    url = f"{HELIUS_API}/addresses/{addr}/transactions?type=SWAP&api-key={HELIUS_KEY}"
+# ============================================================
+# V9.6 ENRICHMENT: Bundle Detection, Freeze Authority, Creator History
+# ============================================================
+
+async def fetch_bundle_info(token_addr: str) -> dict:
+    """Detect bundle buying via Helius REST API.
+    Bundle = 3+ buys in the same block slot.
+    Returns {"bundle_detected": bool, "bundle_count": int}."""
+    if not HELIUS_API or not HELIUS_API_KEY:
+        return {"bundle_detected": False, "bundle_count": 0}
+    url = f"{HELIUS_API}/addresses/{token_addr}/transactions?type=SWAP&api-key={HELIUS_API_KEY}"
     try:
-        r = sess.get(url, timeout=10, stream=True)
-        content = b""
-        for chunk in r.iter_content(8192):
-            content += chunk
-            if len(content) > 1_000_000:
-                break
-        data = json.loads(content)
-    except Exception:
-        return None, False, 0
+        session = await _get_rpc_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                content = b""
+                async for chunk in resp.content.iter_chunked(8192):
+                    content += chunk
+                    if len(content) > 1_000_000:
+                        break
+                data = json.loads(content)
+        if HELIUS_API_KEY:
+            helius_tracker.record_call()
+    except Exception as e:
+        log.warning(f"Bundle check failed for {token_addr[:8]}: {e}")
+        return {"bundle_detected": False, "bundle_count": 0}
 
     if not isinstance(data, list):
-        return None, False, 0
+        return {"bundle_detected": False, "bundle_count": 0}
 
     buys_by_block = {}
-    trade_rows = []
     for tx in data:
         slot = tx.get("slot", 0)
-        ts = tx.get("timestamp", 0)
         fee_payer = tx.get("feePayer", "")
-        sol_amount = 0
         direction = "unknown"
-        native_txs = tx.get("nativeTransfers", [])
-        for nt in native_txs:
-            amt = nt.get("amount", 0) / 1e9
-            if amt > 0.001:
-                sol_amount = max(sol_amount, amt)
         token_txs = tx.get("tokenTransfers", [])
         for tt in token_txs:
-            if tt.get("mint") == addr:
+            if tt.get("mint") == token_addr:
                 if tt.get("toUserAccount") == fee_payer:
                     direction = "buy"
                 elif tt.get("fromUserAccount") == fee_payer:
                     direction = "sell"
         if direction == "buy":
             buys_by_block.setdefault(slot, []).append(fee_payer)
-        trade_rows.append((addr, ts, direction, sol_amount, slot, fee_payer))
 
     bundle = False
     bundle_count = 0
@@ -577,16 +403,27 @@ def fetch_trades_and_bundles(addr):
             bundle = True
             bundle_count = max(bundle_count, len(signers))
 
-    return trade_rows, bundle, bundle_count
+    return {"bundle_detected": bundle, "bundle_count": bundle_count}
 
 
-def check_token_safety(mint_address):
+async def check_freeze_authority(mint_address: str) -> dict:
+    """Check freeze_authority and mint_authority via getAccountInfo RPC.
+    Returns {"freeze_authority": bool or None, "mint_authority": bool or None}."""
+    if not HELIUS_RPC:
+        return {"freeze_authority": None, "mint_authority": None}
     payload = {
         "jsonrpc": "2.0", "id": 1,
         "method": "getAccountInfo",
         "params": [mint_address, {"encoding": "jsonParsed"}]
     }
-    data = safe_post(HELIUS_RPC, payload, timeout=5)
+    try:
+        data = await rpc_call("getAccountInfo", [mint_address, {"encoding": "jsonParsed"}], HELIUS_RPC)
+        if HELIUS_API_KEY:
+            helius_tracker.record_call()
+    except Exception as e:
+        log.warning(f"Freeze authority check failed for {mint_address[:8]}: {e}")
+        return {"freeze_authority": None, "mint_authority": None}
+
     if not data:
         return {"freeze_authority": None, "mint_authority": None}
     info = (data.get("result") or {}).get("value", {})
@@ -599,12 +436,23 @@ def check_token_safety(mint_address):
     }
 
 
-def check_creator_history(creator_addr):
-    if not creator_addr:
+async def check_creator_history(creator_addr: str) -> int:
+    """Check if creator deployed other tokens via Helius REST API.
+    Returns count of OTHER tokens created (excluding current), or -1 on failure."""
+    if not creator_addr or not HELIUS_API or not HELIUS_API_KEY:
         return -1
-    url = f"{HELIUS_API}/addresses/{creator_addr}/transactions?type=TOKEN_MINT&api-key={HELIUS_KEY}"
-    data = safe_get(url, timeout=8)
-    if not data or not isinstance(data, list):
+    url = f"{HELIUS_API}/addresses/{creator_addr}/transactions?type=TOKEN_MINT&api-key={HELIUS_API_KEY}"
+    try:
+        session = await _get_rpc_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                data = await resp.json()
+        if HELIUS_API_KEY:
+            helius_tracker.record_call()
+    except Exception as e:
+        log.warning(f"Creator history check failed for {creator_addr[:8]}: {e}")
+        return -1
+
+    if not isinstance(data, list):
         return -1
     mints = set()
     for tx in data:
@@ -614,1215 +462,1507 @@ def check_creator_history(creator_addr):
                 mints.add(m)
     return max(0, len(mints) - 1)
 
+# ============================================================
+# TELEGRAM (async, non-blocking)
+# ============================================================
 
-def enrich_token(addr):
-    with state_lock:
-        tok = state["tokens"].get(addr)
-        if not tok or tok.get("enriched"):
-            return
-        tok["enriched"] = True
-        creator = tok.get("pre_creator", "")
-
-    holders = fetch_holder_concentration(addr)
-    if holders:
-        with state_lock:
-            tok = state["tokens"].get(addr)
-            if tok:
-                tok["top1_holder_pct"] = holders["top1"]
-                tok["top5_holder_pct"] = holders["top5"]
-                tok["top10_holder_pct"] = holders["top10"]
-        with get_db() as db:
-            db.execute("UPDATE tokens SET top1_holder_pct=?,top5_holder_pct=?,top10_holder_pct=? WHERE address=?",
-                       (holders["top1"], holders["top5"], holders["top10"], addr))
-
-    trade_rows, bundle, bundle_count = fetch_trades_and_bundles(addr)
-    if trade_rows:
-        with get_db() as db:
-            db.executemany("INSERT INTO trades (token_address,ts,direction,sol_amount,block_slot,signer) VALUES (?,?,?,?,?,?)",
-                          trade_rows)
-    with state_lock:
-        tok = state["tokens"].get(addr)
-        if tok:
-            tok["bundle_detected"] = 1 if bundle else 0
-            tok["bundle_buy_count"] = bundle_count
-    with get_db() as db:
-        db.execute("UPDATE tokens SET bundle_detected=?,bundle_buy_count=? WHERE address=?",
-                   (1 if bundle else 0, bundle_count, addr))
-
-    safety = check_token_safety(addr)
-    freeze = 1 if safety.get("freeze_authority") else 0
-    mint = 1 if safety.get("mint_authority") else 0
-    with state_lock:
-        tok = state["tokens"].get(addr)
-        if tok:
-            tok["freeze_authority"] = freeze
-            tok["mint_authority"] = mint
-    with get_db() as db:
-        db.execute("UPDATE tokens SET freeze_authority=?,mint_authority=? WHERE address=?",
-                   (freeze, mint, addr))
-
-    prev = check_creator_history(creator)
-    if prev >= 0:
-        with state_lock:
-            tok = state["tokens"].get(addr)
-            if tok:
-                tok["creator_prev_tokens"] = prev
-        with get_db() as db:
-            db.execute("UPDATE tokens SET creator_prev_tokens=? WHERE address=?", (prev, addr))
-
-    logger.info("Enriched %s: top1=%.1f%% bundle=%s freeze=%d creator_prev=%d",
-                addr[:8], holders["top1"] if holders else -1, bundle, freeze, prev)
+# Persistent aiohttp session for Telegram calls — initialized in bot start()
+_tg_session: Optional[aiohttp.ClientSession] = None
 
 
-# --- Alert Engine ------------------------------------------------------------
-
-def evaluate_alert(addr):
-    with state_lock:
-        tok = state["tokens"].get(addr)
-        if not tok or tok.get("alert_evaluated"):
-            return None, None
-        tok["alert_evaluated"] = True
-        first_price = tok.get("first_price", 0)
-        current_price = tok.get("current_price", 0)
-        top1 = tok.get("top1_holder_pct", 0)
-        bundle = tok.get("bundle_detected", -1)
-        freeze = tok.get("freeze_authority", -1)
-        mint = tok.get("mint_authority", -1)
-        curve_dur = tok.get("curve_duration_sec", 0)
-        current_gain = tok.get("current_gain_pct", 0)
-        creator_prev = tok.get("creator_prev_tokens", -1)
-        liq = tok.get("current_liquidity", 0)
-        symbol = tok.get("symbol", "???")
-
-    entry_filters = {}
-    safety_checks = {}
-
-    entry_filters["top1_gte_99"] = top1 >= 99
-    entry_filters["top1_gte_95"] = top1 >= 95
-    entry_filters["bundle_detected"] = bundle == 1
-    entry_filters["price_up_5pct"] = current_gain > 5
-
-    kill = False
-    kill_reasons = []
-    if curve_dur > 300:
-        kill = True
-        kill_reasons.append(f"curve_dur={curve_dur:.0f}s")
-    if current_gain < -10:
-        kill = True
-        kill_reasons.append(f"price_down={current_gain:.1f}%")
-    if creator_prev >= 1:
-        kill = True
-        kill_reasons.append(f"serial_creator={creator_prev}")
-
-    entry_filters["no_kill_signal"] = not kill
-
-    safety_checks["freeze_authority"] = "BLOCK" if freeze == 1 else "PASS"
-    safety_checks["mint_authority"] = "WARN" if mint == 1 else "PASS"
-    safety_checks["liquidity"] = f"${liq:.0f}" if liq else "$0"
-    safety_checks["zero_liquidity"] = "WARN" if liq == 0 else "PASS"
-
-    has_momentum = entry_filters["price_up_5pct"]
-    has_holder_signal = entry_filters["top1_gte_95"] or entry_filters["bundle_detected"]
-    no_kill = entry_filters["no_kill_signal"]
-
-    entry_pass = (has_momentum and has_holder_signal and no_kill) or \
-                 (entry_filters["top1_gte_99"] and entry_filters["bundle_detected"] and no_kill)
-
-    blocked = safety_checks["freeze_authority"] == "BLOCK"
-
-    if not entry_pass or blocked:
-        return None, None
-
-    if entry_filters["top1_gte_99"] and entry_filters["bundle_detected"] and has_momentum:
-        grade = "A"
-    elif has_momentum and entry_filters["top1_gte_99"]:
-        grade = "A"
-    elif has_momentum and has_holder_signal:
-        grade = "B"
-    else:
-        grade = "C"
-
-    entry_filters_json = json.dumps(entry_filters)
-
-    ts = time.time()
-    with get_db() as db:
-        db.execute("""INSERT INTO alerts (token_address,symbol,ts,grade,entry_filters,safety_checks,price_at_alert,action)
-            VALUES (?,?,?,?,?,?,?,?)""",
-            (addr, symbol, ts, grade, entry_filters_json, json.dumps(safety_checks), current_price, "pending"))
-
-    logger.info("ALERT %s-grade: %s (%s) price=$%.6f gain=%.1f%% liq=$%.0f",
-                grade, symbol, addr[:8], current_price, current_gain, liq)
-    return grade, entry_filters_json
-
-
-# --- Circuit Breakers --------------------------------------------------------
-
-def check_circuit_breaker():
-    """Check if circuit breakers are tripped. Returns (active, reason)."""
-    with state_lock:
-        now = time.time()
-        # Reset hourly counter
-        if now - state["hourly_reset_time"] > 3600:
-            state["hourly_pnl"] = 0.0
-            state["hourly_reset_time"] = now
-
-        if state["daily_pnl"] <= DAILY_LOSS_LIMIT_SOL:
-            state["circuit_breaker_active"] = True
-            state["circuit_breaker_reason"] = f"Daily loss limit hit: {state['daily_pnl']:+.4f} SOL"
-            return True, state["circuit_breaker_reason"]
-
-        if state["hourly_pnl"] <= HOURLY_LOSS_LIMIT_SOL:
-            state["circuit_breaker_active"] = True
-            state["circuit_breaker_reason"] = f"Hourly loss limit hit: {state['hourly_pnl']:+.4f} SOL"
-            return True, state["circuit_breaker_reason"]
-
-        if state["consecutive_losses"] >= CONSECUTIVE_LOSS_PAUSE:
-            state["circuit_breaker_active"] = True
-            state["circuit_breaker_reason"] = f"Consecutive loss streak: {state['consecutive_losses']}"
-            return True, state["circuit_breaker_reason"]
-
-        state["circuit_breaker_active"] = False
-        state["circuit_breaker_reason"] = ""
-        return False, ""
-
-
-def update_circuit_breaker_pnl(pnl_sol):
-    """Update circuit breaker counters after a trade closes."""
-    with state_lock:
-        state["daily_pnl"] += pnl_sol
-        state["hourly_pnl"] += pnl_sol
-        if pnl_sol < 0:
-            state["consecutive_losses"] += 1
-        else:
-            state["consecutive_losses"] = 0
-
-
-# --- Shadow Trading Engine ---------------------------------------------------
-
-def get_trade_count(addr):
-    """Get number of trades already done for this token."""
-    with state_lock:
-        count = state["traded_addresses"].get(addr, 0)
-    if count == 0:
-        with get_db() as db:
-            row = db.execute("SELECT COUNT(*) as c FROM shadow_trades WHERE token_address=?", (addr,)).fetchone()
-            count = row["c"]
-            if count > 0:
-                with state_lock:
-                    state["traded_addresses"][addr] = count
-    return count
-
-
-def can_trade(addr, is_reentry=False):
-    """Check if we can trade this token (respects max trades per token)."""
-    count = get_trade_count(addr)
-    if is_reentry:
-        return count < MAX_TRADES_PER_TOKEN
-    else:
-        return count == 0
-
-
-def open_shadow_position(addr, grade, entry_filters_json="", is_reentry=False):
-    with state_lock:
-        tok = state["tokens"].get(addr)
-        if not tok:
-            return
-        if not is_reentry:
-            tok["shadow_entry_scheduled"] = True
-            tok["_entry_filters_json"] = entry_filters_json
-        symbol = tok.get("symbol", "???")
-        liq = tok.get("current_liquidity", 0)
-
-    # V9.6: Min liquidity gate
-    if liq < MIN_LIQUIDITY_USD:
-        log_missed_opportunity(addr, grade, f"low_liq_${liq:.0f}")
-        logger.info("Skip %s: liq=$%.0f < $%d minimum", symbol, liq, MIN_LIQUIDITY_USD)
+async def _tg_send_async(msg: str):
+    """Async Telegram send using persistent aiohttp session. Non-blocking."""
+    global _tg_session
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
-
-    tag = "RE-ENTRY" if is_reentry else "BUY"
-    logger.info("Shadow %s scheduled: %s (%s) grade=%s liq=$%.0f", tag, symbol, addr[:8], grade, liq)
-
-    if is_reentry:
-        # For re-entries, execute immediately (no delay)
-        execute_shadow_entry(addr, is_reentry=True, grade_override=grade)
-
-
-def execute_shadow_entry(addr, is_reentry=False, grade_override=None):
-    # Check circuit breaker
-    cb_active, cb_reason = check_circuit_breaker()
-    if cb_active:
-        logger.warning("CIRCUIT BREAKER active, skipping entry: %s", cb_reason)
-        return
-
-    with state_lock:
-        tok = state["tokens"].get(addr)
-        if not tok:
-            return
-        price = tok.get("current_price", 0)
-        liq = tok.get("current_liquidity", 0)
-        symbol = tok.get("symbol", "???")
-        entry_filters_json = tok.get("_entry_filters_json", "")
-
-    if not price:
-        return
-
-    # V9.6: Min liq gate check at execution time too
-    if liq < MIN_LIQUIDITY_USD:
-        logger.info("Skip entry %s at exec: liq=$%.0f < $%d", symbol, liq, MIN_LIQUIDITY_USD)
-        return
-
-    # V9.6: TX failure simulation
-    tx_failed = random.random() < TX_FAILURE_RATE
-    if tx_failed:
-        logger.info("TX FAILURE simulated for %s (%.0f%% chance)", symbol, TX_FAILURE_RATE * 100)
-
-    # Shadow entry price (3% slippage)
-    shadow_entry_price = price * (1 + SHADOW_BUY_SLIPPAGE)
-    # Reality entry price (12% slippage)
-    reality_entry_price = price * (1 + REALITY_BUY_SLIPPAGE)
-
-    ts = time.time()
-
-    grade = grade_override or "C"
-    if not grade_override:
-        with get_db() as db:
-            row = db.execute("SELECT grade, entry_filters FROM alerts WHERE token_address=? ORDER BY ts DESC LIMIT 1", (addr,)).fetchone()
-            if row:
-                grade = row["grade"]
-                if not entry_filters_json:
-                    entry_filters_json = row["entry_filters"] or ""
-
-    trade_number = get_trade_count(addr) + 1
-
-    with get_db() as db:
-        db.execute("""INSERT INTO shadow_trades
-            (token_address,symbol,alert_grade,trade_number,entry_time,entry_price,entry_liquidity,
-             entry_filters,position_size_sol,peak_price_during,status,
-             remaining_pct,progressive_sold,progressive_banked_sol,tx_failure_simulated)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (addr, symbol, grade, trade_number, ts, shadow_entry_price, liq,
-             entry_filters_json, POSITION_SIZE_SOL, shadow_entry_price, "open",
-             1.0, "[]", 0.0, 1 if tx_failed else 0))
-        trade_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-    with state_lock:
-        state["open_positions"][addr] = {
-            "trade_id": trade_id,
-            "entry_price": shadow_entry_price,
-            "reality_entry_price": reality_entry_price,
-            "entry_time": ts,
-            "entry_liquidity": liq,
-            "position_size_sol": POSITION_SIZE_SOL,
-            "peak_price": shadow_entry_price,
-            "symbol": symbol,
-            "grade": grade,
-            "trade_number": trade_number,
-            "tx_failed": tx_failed,
-            # Progressive exit tracking
-            "progressive_sold": [],  # list of (threshold_pct, sell_pct, price, sol_banked)
-            "progressive_banked_sol": 0.0,
-            "remaining_pct": 1.0,
-        }
-        state["traded_addresses"][addr] = trade_number
-
-    tag = f"#{trade_number}" if trade_number > 1 else ""
-    logger.info("Shadow BUY%s executed: %s @ $%.6f (shadow) / $%.6f (reality) liq=$%.0f grade=%s%s",
-                tag, symbol, shadow_entry_price, reality_entry_price, liq, grade,
-                " [TX FAILED]" if tx_failed else "")
-
-
-def manage_shadow_positions():
-    now = time.time()
-    with state_lock:
-        positions = dict(state["open_positions"])
-
-    for addr, pos in positions.items():
-        with state_lock:
-            tok = state["tokens"].get(addr)
-        if not tok:
-            continue
-
-        current_price = tok.get("current_price", 0)
-        current_liq = tok.get("current_liquidity", 0)
-        if not current_price:
-            continue
-
-        entry_price = pos["entry_price"]
-        entry_time = pos["entry_time"]
-        entry_liq = pos["entry_liquidity"]
-        peak = pos["peak_price"]
-        trade_id = pos["trade_id"]
-        symbol = pos["symbol"]
-        remaining_pct = pos["remaining_pct"]
-        progressive_banked = pos["progressive_banked_sol"]
-        progressive_sold = pos["progressive_sold"]
-        age = now - entry_time
-        gain_pct = ((current_price / entry_price) - 1) * 100 if entry_price else 0
-
-        if current_price > peak:
-            peak = current_price
-            with state_lock:
-                if addr in state["open_positions"]:
-                    state["open_positions"][addr]["peak_price"] = peak
-            with get_db() as db:
-                db.execute("UPDATE shadow_trades SET peak_price_during=? WHERE id=?", (peak, trade_id))
-
-        # V9.6: Progressive exit ladder
-        for threshold_pct, sell_pct in PROGRESSIVE_LADDER:
-            already_sold_this = any(s[0] == threshold_pct for s in progressive_sold)
-            if not already_sold_this and gain_pct >= threshold_pct and remaining_pct > 0.01:
-                actual_sell = min(sell_pct, remaining_pct)
-                sell_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
-                sol_from_sell = POSITION_SIZE_SOL * actual_sell * (sell_price / entry_price)
-                cost_basis = POSITION_SIZE_SOL * actual_sell
-                banked_profit = sol_from_sell - cost_basis
-
-                progressive_sold.append((threshold_pct, actual_sell, sell_price, banked_profit))
-                progressive_banked += banked_profit
-                remaining_pct -= actual_sell
-
-                with state_lock:
-                    if addr in state["open_positions"]:
-                        state["open_positions"][addr]["progressive_sold"] = progressive_sold
-                        state["open_positions"][addr]["progressive_banked_sol"] = progressive_banked
-                        state["open_positions"][addr]["remaining_pct"] = remaining_pct
-
-                with get_db() as db:
-                    db.execute("""UPDATE shadow_trades SET progressive_sold=?, progressive_banked_sol=?,
-                        remaining_pct=? WHERE id=?""",
-                        (json.dumps(progressive_sold), progressive_banked, remaining_pct, trade_id))
-
-                logger.info("PROGRESSIVE SELL %.0f%% of %s at +%.0f%% @ $%.6f | banked=%.4f SOL | remaining=%.0f%%",
-                            actual_sell * 100, symbol, threshold_pct, sell_price, banked_profit, remaining_pct * 100)
-
-        exit_reason = ""
-        exit_price = 0
-
-        # EMERGENCY: liquidity drop
-        if entry_liq > 0 and current_liq > 0:
-            liq_drop = ((entry_liq - current_liq) / entry_liq) * 100
-            if liq_drop > EMERGENCY_LIQ_DROP_PCT:
-                exit_reason = f"EMERGENCY_LIQ_DROP_{liq_drop:.0f}pct"
-                exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
-
-        # Stop loss
-        if not exit_reason and gain_pct <= -STOP_LOSS_PCT:
-            exit_reason = f"STOP_LOSS_{gain_pct:.1f}pct"
-            exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
-
-        # Hard exit at 15 min
-        if not exit_reason and age >= HARD_EXIT_SECONDS:
-            exit_reason = f"HARD_EXIT_{age:.0f}s"
-            exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
-
-        # Max hold
-        if not exit_reason and age >= MAX_HOLD_SECONDS:
-            exit_reason = f"MAX_HOLD_{age:.0f}s"
-            exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
-
-        # Trailing stop at 15% from peak (on remaining position)
-        if not exit_reason and peak > entry_price:
-            drop_from_peak = ((peak - current_price) / peak) * 100
-            if drop_from_peak >= TRAILING_STOP_PCT:
-                exit_reason = f"TRAILING_STOP_{drop_from_peak:.1f}pct_from_peak"
-                exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
-
-        if exit_reason:
-            if not exit_price:
-                exit_price = current_price * (1 - SHADOW_SELL_SLIPPAGE)
-
-            # Shadow PnL (old-style 3% slippage on remaining)
-            remaining_exit_pnl = POSITION_SIZE_SOL * remaining_pct * ((exit_price / entry_price) - 1) if entry_price else 0
-            shadow_pnl = progressive_banked + remaining_exit_pnl
-
-            # Reality PnL (12% slippage)
-            reality_entry = pos.get("reality_entry_price", entry_price)
-            is_liq_exit = "EMERGENCY_LIQ" in exit_reason
-            tx_failed = pos.get("tx_failed", False)
-
-            if tx_failed:
-                # TX failed at entry, no position opened, no gain no loss (just lost gas)
-                realistic_pnl = -0.005  # ~gas cost
-            elif is_liq_exit:
-                # V9.6: Liq exit with reality slippage
-                # If liq dropped to near 0, sell would fail -> -100% on remaining
-                if current_liq < 100:  # effectively zero liquidity
-                    realistic_remaining = -POSITION_SIZE_SOL * remaining_pct  # total loss on remaining
-                else:
-                    realistic_remaining = POSITION_SIZE_SOL * remaining_pct * ((current_price * (1 - REALITY_SELL_SLIPPAGE) / reality_entry) - 1)
-                # Progressive sells already banked (with reality slippage adjustment)
-                reality_progressive = progressive_banked * (1 - REALITY_SELL_SLIPPAGE) / (1 - SHADOW_SELL_SLIPPAGE) if progressive_banked else 0
-                realistic_pnl = reality_progressive + realistic_remaining
-            else:
-                reality_exit = current_price * (1 - REALITY_SELL_SLIPPAGE)
-                realistic_remaining = POSITION_SIZE_SOL * remaining_pct * ((reality_exit / reality_entry) - 1) if reality_entry else 0
-                reality_progressive = progressive_banked * (1 - REALITY_SELL_SLIPPAGE) / (1 - SHADOW_SELL_SLIPPAGE) if progressive_banked else 0
-                realistic_pnl = reality_progressive + realistic_remaining
-
-            shadow_pnl_pct = (shadow_pnl / POSITION_SIZE_SOL) * 100
-
-            # Check if this is a re-entry candidate (for future re-entry)
-            reentry_candidate = 0
-            if "HARD_EXIT" in exit_reason and shadow_pnl_pct > REENTRY_MIN_GAIN_PCT:
-                reentry_candidate = 1
-
-            with get_db() as db:
-                db.execute("""UPDATE shadow_trades SET exit_time=?,exit_price=?,exit_reason=?,
-                    pnl_sol=?,pnl_pct=?,shadow_pnl_sol=?,realistic_pnl_sol=?,
-                    peak_price_during=?,status='closed',
-                    remaining_pct=?,progressive_sold=?,progressive_banked_sol=?,
-                    reentry_candidate=? WHERE id=?""",
-                    (now, exit_price, exit_reason, shadow_pnl, shadow_pnl_pct,
-                     shadow_pnl, realistic_pnl, peak, remaining_pct,
-                     json.dumps(progressive_sold), progressive_banked,
-                     reentry_candidate, trade_id))
-
-            with state_lock:
-                state["open_positions"].pop(addr, None)
-
-            # Update circuit breaker with realistic PnL
-            update_circuit_breaker_pnl(realistic_pnl)
-
-            color = "WIN" if shadow_pnl >= 0 else "LOSS"
-            logger.info("%s Shadow EXIT %s: %s pnl=%.4f SOL (%.1f%%) reality=%.4f SOL | %s%s%s",
-                        color, symbol, addr[:8], shadow_pnl, shadow_pnl_pct, realistic_pnl,
-                        exit_reason,
-                        " [TX_FAIL]" if tx_failed else "",
-                        " [REENTRY_CANDIDATE]" if reentry_candidate else "")
-
-            # V9.6: Schedule re-entry if candidate
-            if reentry_candidate and can_trade(addr, is_reentry=True):
-                with state_lock:
-                    grade = pos.get("grade", "B")
-                    state["reentry_candidates"][addr] = {
-                        "grade": grade,
-                        "exit_gain_pct": shadow_pnl_pct,
-                        "exit_time": now,
-                        "symbol": symbol,
-                    }
-                logger.info("RE-ENTRY queued: %s (exited at +%.1f%%, grade=%s)", symbol, shadow_pnl_pct, grade)
-
-
-def process_reentries():
-    """Process pending re-entry candidates."""
-    now = time.time()
-    with state_lock:
-        candidates = dict(state["reentry_candidates"])
-
-    for addr, info in candidates.items():
-        # Wait 5 seconds after exit before re-entering
-        if now - info["exit_time"] < 5:
-            continue
-
-        # Check if still eligible
-        if not can_trade(addr, is_reentry=True):
-            with state_lock:
-                state["reentry_candidates"].pop(addr, None)
-            continue
-
-        # Check if already in a position
-        skip_in_position = False
-        with state_lock:
-            if addr in state["open_positions"]:
-                skip_in_position = True
-        if skip_in_position:
-            continue
-
-        # Check circuit breaker
-        cb_active, _ = check_circuit_breaker()
-        if cb_active:
-            continue
-
-        # Check current price is still moving up
-        skip_no_tok = False
-        liq = 0
-        with state_lock:
-            tok = state["tokens"].get(addr)
-            if not tok:
-                state["reentry_candidates"].pop(addr, None)
-                skip_no_tok = True
-            else:
-                liq = tok.get("current_liquidity", 0)
-        if skip_no_tok:
-            continue
-
-        # Check liq gate
-        if liq < MIN_LIQUIDITY_USD:
-            logger.info("Re-entry skip %s: liq=$%.0f < $%d", info["symbol"], liq, MIN_LIQUIDITY_USD)
-            with state_lock:
-                state["reentry_candidates"].pop(addr, None)
-            continue
-
-        # Execute re-entry
-        open_shadow_position(addr, info["grade"], is_reentry=True)
-        with state_lock:
-            state["reentry_candidates"].pop(addr, None)
-
-
-def log_missed_opportunity(addr, grade, reason):
-    with state_lock:
-        tok = state["tokens"].get(addr)
-        symbol = tok.get("symbol", "???") if tok else "???"
-    ts = time.time()
-    with get_db() as db:
-        db.execute("INSERT INTO missed_opportunities (token_address,symbol,ts,alert_grade,reason) VALUES (?,?,?,?,?)",
-                   (addr, symbol, ts, grade, reason))
-    logger.info("Missed opportunity: %s (%s) grade=%s reason=%s", symbol, addr[:8], grade, reason)
-
-
-def update_missed_outcomes():
-    with get_db() as db:
-        rows = db.execute("SELECT id,token_address FROM missed_opportunities WHERE peak_gain_pct=0").fetchall()
-        for row in rows:
-            tok_row = db.execute("SELECT peak_gain_pct,final_gain_pct FROM tokens WHERE address=?",
-                                (row["token_address"],)).fetchone()
-            if tok_row:
-                db.execute("UPDATE missed_opportunities SET peak_gain_pct=?,final_gain_pct=? WHERE id=?",
-                           (tok_row["peak_gain_pct"], tok_row["final_gain_pct"], row["id"]))
-
-
-# --- SOL price and FNG -------------------------------------------------------
-
-def refresh_sol_price():
-    data = safe_get(COINGECKO_SOL)
-    if data and "solana" in data:
-        price = data["solana"].get("usd", 0)
-        if price:
-            with state_lock:
-                state["sol_price"] = price
-                state["last_sol_refresh"] = time.time()
-
-
-def refresh_fng():
-    data = safe_get(FNG_URL)
-    if data and "data" in data and data["data"]:
-        val = int(data["data"][0].get("value", 0))
-        with state_lock:
-            state["fng"] = val
-            state["last_fng_refresh"] = time.time()
-
-
-# --- Lifecycle Management ----------------------------------------------------
-
-def manage_lifecycle():
-    now = time.time()
-    with state_lock:
-        tokens_copy = list(state["tokens"].items())
-
-    for addr, tok in tokens_copy:
-        age = now - tok["detected_at"]
-        status = tok.get("status", "collecting")
-
-        new_status = status
-        if status == "collecting" and age >= FIRST_MINUTE_SECS:
-            new_status = "extended"
-        elif status == "extended" and age >= EXTENDED_MONITOR_SECS:
-            new_status = "complete"
-            first_p = tok.get("first_price", 0)
-            curr_p = tok.get("current_price", 0)
-            final_gain = ((curr_p / first_p) - 1) * 100 if first_p and curr_p else 0
-            with get_db() as db:
-                db.execute("UPDATE tokens SET final_gain_pct=?,status='complete' WHERE address=?",
-                           (final_gain, addr))
-            with state_lock:
-                if addr in state["tokens"]:
-                    state["tokens"][addr]["final_gain_pct"] = final_gain
-
-        if new_status != status:
-            with state_lock:
-                if addr in state["tokens"]:
-                    state["tokens"][addr]["status"] = new_status
-            if new_status != "complete":
-                with get_db() as db:
-                    db.execute("UPDATE tokens SET status=? WHERE address=?", (new_status, addr))
-
-
-def cleanup_old():
-    now = time.time()
-    cutoff = now - CLEANUP_AGE_HOURS * 3600
-    with state_lock:
-        to_remove = [addr for addr, tok in state["tokens"].items()
-                     if tok["detected_at"] < cutoff and tok["status"] == "complete"
-                     and addr not in state["open_positions"]]
-        for addr in to_remove:
-            del state["tokens"][addr]
-    if to_remove:
-        logger.info("Cleaned up %d old tokens from memory", len(to_remove))
-
-
-def post_trade_hindsight():
-    now = time.time()
-    with get_db() as db:
-        trades_to_check = db.execute("""
-            SELECT id, token_address, symbol, exit_time, entry_price, exit_price, exit_reason, pnl_pct
-            FROM shadow_trades
-            WHERE status='closed' AND hindsight_checked=0 AND exit_time > 0
-            AND ? - exit_time > 600
-            LIMIT 5
-        """, (now,)).fetchall()
-
-    if not trades_to_check:
-        return
-
-    for trade in trades_to_check:
-        addr = trade["token_address"]
-        exit_time = trade["exit_time"]
-        entry_price = trade["entry_price"]
-        symbol = trade["symbol"]
-
-        try:
-            url = f"{DEXSCREENER_BATCH}/{addr}"
-            resp = requests.get(url, timeout=5)
-            data = resp.json()
-            pairs = data.get("pairs") or []
-            current_price = float(pairs[0].get("priceUsd", 0) or 0) if pairs else 0
-        except Exception:
-            current_price = 0
-
-        with get_db() as db:
-            p2 = p5 = p10 = 0
-            for offset_sec, col in [(120, "price_2min_after_exit"), (300, "price_5min_after_exit"), (600, "price_10min_after_exit")]:
-                target_ts = exit_time + offset_sec
-                row = db.execute("""
-                    SELECT price FROM snapshots WHERE token_address=?
-                    AND ts BETWEEN ? AND ? ORDER BY ABS(ts - ?) LIMIT 1
-                """, (addr, target_ts - 15, target_ts + 15, target_ts)).fetchone()
-                if row and row["price"]:
-                    if col == "price_2min_after_exit": p2 = row["price"]
-                    elif col == "price_5min_after_exit": p5 = row["price"]
-                    else: p10 = row["price"]
-
-            if not p10 and current_price:
-                p10 = current_price
-
-            db.execute("""
-                UPDATE shadow_trades SET
-                    price_2min_after_exit=?, price_5min_after_exit=?, price_10min_after_exit=?,
-                    hindsight_checked=1
-                WHERE id=?
-            """, (p2, p5, p10, trade["id"]))
-
-        pnl_actual = trade["pnl_pct"]
-        pnl_if_held_10 = ((p10 / entry_price) - 1) * 100 if entry_price and p10 else 0
-
-        verdict = "GOOD EXIT" if pnl_actual >= pnl_if_held_10 else "LEFT MONEY"
-        logger.info("Hindsight %s: exited at %+.1f%% (%s) | 10min later: %+.1f%% | %s",
-                     symbol, pnl_actual, trade["exit_reason"], pnl_if_held_10, verdict)
-
-
-# --- Main Loop ---------------------------------------------------------------
-
-def main_loop():
-    logger.info("Wave Rider %s starting main loop", VERSION)
-
-    refresh_sol_price()
-    refresh_fng()
-
-    with state_lock:
-        state["started"] = True
-        state["start_time"] = time.time()
-        state["hourly_reset_time"] = time.time()
-
-    while True:
-        tick_start = time.time()
-        with state_lock:
-            state["tick_count"] += 1
-            tick_num = state["tick_count"]
-
-        # 1. Scan new tokens
-        try:
-            now = time.time()
-            with state_lock:
-                last_grad = state["last_graduated_poll"]
-                last_live = state["last_live_poll"]
-                last_gecko = state["last_gecko_poll"]
-            if now - last_grad >= 3:
-                poll_graduated()
-                with state_lock:
-                    state["last_graduated_poll"] = now
-            if now - last_live >= 6:
-                poll_currently_live()
-                with state_lock:
-                    state["last_live_poll"] = now
-            if now - last_gecko >= 30:
-                poll_geckoterminal()
-                with state_lock:
-                    state["last_gecko_poll"] = now
-        except Exception as e:
-            logger.error("Scan error: %s", e)
-
-        # 2. Price snapshots (V9.6: forces fetch for all open positions)
-        try:
-            collect_price_snapshots()
-        except Exception as e:
-            logger.error("Snapshot error: %s", e)
-
-        # 3. Enrichment
-        try:
-            if tick_num % 3 == 0:
-                now = time.time()
-                with state_lock:
-                    to_enrich = [(addr, tok) for addr, tok in state["tokens"].items()
-                                 if not tok.get("enriched") and 25 <= now - tok["detected_at"] <= 90]
-                for addr, tok in to_enrich[:1]:
-                    try:
-                        enrich_token(addr)
-                    except Exception as e:
-                        logger.error("Enrich %s error: %s", addr[:8], e)
-        except Exception as e:
-            logger.error("Enrichment error: %s", e)
-
-        # 4. Alert engine
-        try:
-            now = time.time()
-            with state_lock:
-                to_evaluate = [(addr, tok) for addr, tok in state["tokens"].items()
-                               if not tok.get("alert_evaluated") and tok.get("enriched")
-                               and now - tok["detected_at"] >= ALERT_SECOND]
-            for addr, tok in to_evaluate:
-                try:
-                    result = evaluate_alert(addr)
-                    grade = result[0] if result else None
-                    entry_filters_json = result[1] if result else ""
-                    if grade:
-                        if grade == "C":
-                            log_missed_opportunity(addr, grade, "c_grade_shadow_only")
-                        elif not can_trade(addr):
-                            logger.info("Skip duplicate: %s already traded", tok.get("symbol","?"))
-                        else:
-                            # Check circuit breaker before opening
-                            cb_active, cb_reason = check_circuit_breaker()
-                            if cb_active:
-                                log_missed_opportunity(addr, grade, f"circuit_breaker:{cb_reason[:30]}")
-                            else:
-                                open_shadow_position(addr, grade, entry_filters_json)
-                except Exception as e:
-                    logger.error("Alert eval %s error: %s", addr[:8], e)
-        except Exception as e:
-            logger.error("Alert engine error: %s", e)
-
-        # 5. Shadow trader
-        try:
-            now = time.time()
-            with state_lock:
-                scheduled = [(addr, tok) for addr, tok in state["tokens"].items()
-                             if tok.get("shadow_entry_scheduled") and not tok.get("shadow_entered")
-                             and now - tok["detected_at"] >= ALERT_SECOND + HUMAN_DELAY]
-            for addr, tok in scheduled:
-                try:
-                    execute_shadow_entry(addr)
-                    with state_lock:
-                        if addr in state["tokens"]:
-                            state["tokens"][addr]["shadow_entered"] = True
-                except Exception as e:
-                    logger.error("Shadow entry %s error: %s", addr[:8], e)
-
-            manage_shadow_positions()
-
-            # V9.6: Process re-entries
-            process_reentries()
-
-        except Exception as e:
-            logger.error("Shadow trader error: %s", e)
-
-        # 6. Lifecycle
-        try:
-            manage_lifecycle()
-        except Exception as e:
-            logger.error("Lifecycle error: %s", e)
-
-        # 7. Cleanup
-        try:
-            if tick_num % 100 == 0:
-                cleanup_old()
-                update_missed_outcomes()
-        except Exception as e:
-            logger.error("Cleanup error: %s", e)
-
-        # 7b. Post-trade hindsight
-        try:
-            if tick_num % 20 == 0:
-                post_trade_hindsight()
-        except Exception as e:
-            logger.error("Hindsight error: %s", e)
-
-        # 8. SOL price + FNG
-        try:
-            now = time.time()
-            with state_lock:
-                last_sol = state["last_sol_refresh"]
-                last_fng = state["last_fng_refresh"]
-            if now - last_sol >= 60:
-                refresh_sol_price()
-            if now - last_fng >= 300:
-                refresh_fng()
-        except Exception as e:
-            logger.error("Price/FNG refresh error: %s", e)
-
-        elapsed = time.time() - tick_start
-        sleep_time = max(0, TICK_INTERVAL - elapsed)
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-
-
-# --- Flask App ---------------------------------------------------------------
-
-app = Flask(__name__)
-_bg_thread_started = False
-
-
-@app.before_request
-def startup():
-    global _bg_thread_started
-    if not _bg_thread_started:
-        _bg_thread_started = True
-        init_db()
-        t = threading.Thread(target=main_loop, daemon=True)
-        t.start()
-        logger.info("Background thread started")
-
-
-# --- Dashboard ---------------------------------------------------------------
-
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Wave Rider V9.6 - Reality Mirror</title>
-<meta http-equiv="refresh" content="10">
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d1117;color:#c9d1d9;font-family:'SF Mono',Consolas,monospace;font-size:13px;padding:16px}
-h1{color:#58a6ff;font-size:20px;margin-bottom:4px}
-.sub{color:#8b949e;font-size:12px;margin-bottom:16px}
-.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.stat{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 14px;min-width:120px}
-.stat .label{color:#8b949e;font-size:10px;text-transform:uppercase}
-.stat .value{font-size:18px;font-weight:700;margin-top:2px}
-.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}
-table{width:100%;border-collapse:collapse;margin-bottom:20px}
-th{background:#161b22;color:#8b949e;text-align:left;padding:8px;font-size:11px;text-transform:uppercase;border-bottom:1px solid #30363d}
-td{padding:6px 8px;border-bottom:1px solid #21262d}
-tr:hover{background:#161b22}
-.section-title{color:#58a6ff;font-size:15px;font-weight:700;margin:16px 0 8px;border-bottom:1px solid #30363d;padding-bottom:4px}
-.badge{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700}
-.badge-a{background:#238636;color:#fff}.badge-b{background:#1f6feb;color:#fff}.badge-c{background:#6e7681;color:#fff}
-.pnl-pos{color:#3fb950;font-weight:700}.pnl-neg{color:#f85149;font-weight:700}
-.empty{color:#484f58;text-align:center;padding:20px}
-.changes{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin-bottom:16px;font-size:11px;color:#8b949e}
-.changes b{color:#58a6ff}
-.cb-active{background:#f8514922;border:1px solid #f85149;border-radius:6px;padding:10px;margin-bottom:16px;color:#f85149;font-weight:700}
-</style></head><body>
-<h1>Wave Rider V9.6 - Reality Mirror Shadow Trader</h1>
-<div class="sub">A+B only | TS=15%% | 15min hold | Progressive exit | Re-entry | $15K liq gate | Circuit breakers | {{time_utc}}</div>
-<div class="changes">
-<b>V9.6 changes:</b> Progressive exit ladder (3%%@+100/3%%@+200/10%%@+500/25%%@+1500/35%%@+5000) | Re-entry after profitable hard exit | $15K min liq | 15min hold (was 11min) | Reality PnL (12%% slippage) | TX failure sim (15%%) | Circuit breakers (-1 SOL daily, 5 streak, -0.5 SOL hourly)
-</div>
-{{circuit_breaker_html}}
-<div class="stats">
-<div class="stat"><div class="label">SOL Price</div><div class="value blue">${{sol_price}}</div></div>
-<div class="stat"><div class="label">FNG</div><div class="value {{fng_color}}">{{fng}}</div></div>
-<div class="stat"><div class="label">Tracking</div><div class="value">{{tracking}}</div></div>
-<div class="stat"><div class="label">Open Positions</div><div class="value yellow">{{open_pos}}</div></div>
-<div class="stat"><div class="label">Total Trades</div><div class="value">{{total_trades}}</div></div>
-<div class="stat"><div class="label">Win Rate</div><div class="value {{wr_color}}">{{win_rate}}</div></div>
-<div class="stat"><div class="label">Shadow P&L</div><div class="value {{pnl_color}}">{{total_pnl}} SOL</div></div>
-<div class="stat"><div class="label">Reality P&L</div><div class="value {{rpnl_color}}">{{reality_pnl}} SOL</div></div>
-<div class="stat"><div class="label">Alerts Today</div><div class="value">{{alerts_today}}</div></div>
-<div class="stat"><div class="label">Uptime</div><div class="value">{{uptime}}</div></div>
-</div>
-
-<div class="section-title">Open Shadow Positions</div>
-{{open_table}}
-
-<div class="section-title">Closed Shadow Trades (Recent 20)</div>
-{{closed_table}}
-
-<div class="section-title">Recent Alerts (20)</div>
-{{alerts_table}}
-
-<div class="section-title">Missed / C-grade Shadow (Recent 10)</div>
-{{missed_table}}
-
-</body></html>"""
-
-
-def render_dashboard():
-    now = time.time()
-    with state_lock:
-        sol_price = state["sol_price"]
-        fng = state["fng"]
-        tracking = len(state["tokens"])
-        open_pos = len(state["open_positions"])
-        start_time = state["start_time"]
-        cb_active = state["circuit_breaker_active"]
-        cb_reason = state["circuit_breaker_reason"]
-        daily_pnl = state["daily_pnl"]
-        hourly_pnl = state["hourly_pnl"]
-        consec = state["consecutive_losses"]
-
-    uptime_s = now - start_time if start_time else 0
-    uptime_h = int(uptime_s // 3600)
-    uptime_m = int((uptime_s % 3600) // 60)
-    uptime = f"{uptime_h}h {uptime_m}m"
-    fng_color = "green" if fng >= 60 else ("red" if fng <= 30 else "yellow")
-
-    circuit_breaker_html = ""
-    if cb_active:
-        circuit_breaker_html = f'<div class="cb-active">CIRCUIT BREAKER ACTIVE: {cb_reason} | Daily: {daily_pnl:+.4f} SOL | Hourly: {hourly_pnl:+.4f} SOL | Streak: {consec}</div>'
-
-    with get_db() as db:
-        closed = db.execute("SELECT * FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC").fetchall()
-        open_trades = db.execute("SELECT * FROM shadow_trades WHERE status='open' ORDER BY entry_time DESC").fetchall()
-        alerts = db.execute("SELECT * FROM alerts ORDER BY ts DESC LIMIT 20").fetchall()
-        missed = db.execute("SELECT * FROM missed_opportunities ORDER BY ts DESC LIMIT 10").fetchall()
-        alerts_today_count = db.execute(
-            "SELECT COUNT(*) as c FROM alerts WHERE ts > ?", (now - 86400,)).fetchone()["c"]
-
-    total_trades = len(closed)
-    wins = sum(1 for t in closed if t["pnl_sol"] > 0)
-    win_rate = f"{(wins/total_trades*100):.0f}%" if total_trades else "N/A"
-    wr_color = "green" if total_trades and wins/total_trades > 0.5 else "red" if total_trades else ""
-    total_pnl = sum(t["pnl_sol"] for t in closed)
-    pnl_color = "green" if total_pnl >= 0 else "red"
     try:
-        reality_total = sum((t["realistic_pnl_sol"] or 0) for t in closed)
-    except (KeyError, IndexError):
-        reality_total = 0
-    rpnl_color = "green" if reality_total >= 0 else "red"
+        if _tg_session is None or _tg_session.closed:
+            _tg_session = aiohttp.ClientSession()
+        async with _tg_session.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": msg},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                log.warning(f"TG send failed ({resp.status}): {body[:100]}")
+    except Exception as e:
+        log.warning(f"TG failed: {e}")
 
-    if open_trades:
-        rows = ""
-        for t in open_trades:
-            with state_lock:
-                tok = state["tokens"].get(t["token_address"], {})
-                pos_data = state["open_positions"].get(t["token_address"], {})
-            curr = tok.get("current_price", 0)
-            gain = ((curr / t["entry_price"]) - 1) * 100 if t["entry_price"] and curr else 0
-            age = now - t["entry_time"]
-            pclass = "pnl-pos" if gain >= 0 else "pnl-neg"
-            grade_class = f"badge-{t['alert_grade'].lower()}" if t['alert_grade'] else "badge-c"
-            remaining = pos_data.get("remaining_pct", 1.0)
-            banked = pos_data.get("progressive_banked_sol", 0)
+
+def tg_send(msg: str):
+    """Fire-and-forget Telegram send. Works from both sync and async contexts.
+    If called from within a running event loop, schedules as a background task.
+    If no loop is running, creates a temporary one (startup/shutdown only)."""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        # We're inside an async context — schedule as fire-and-forget task
+        loop.create_task(_tg_send_async(msg))
+    except RuntimeError:
+        # No event loop running (e.g. during init) — fall back to sync requests
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TG_CHAT_ID, "text": msg},
+                timeout=5,
+            )
+        except Exception as e:
+            log.warning(f"TG sync fallback failed: {e}")
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+DB_PATH = "trades.db"
+
+def get_db() -> sqlite3.Connection:
+    """v4.3: Thread-safe DB connection with WAL mode and timeout."""
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+class DBConnection:
+    """Context manager for get_db() that auto-closes on exit."""
+    def __enter__(self):
+        self.conn = get_db()
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None:
+                self.conn.commit()
+            self.conn.close()
+        except Exception:
+            pass
+        return False
+
+
+def db_connection():
+    """Shorthand: `with db_connection() as conn: ...` — auto-commits and closes."""
+    return DBConnection()
+
+
+def db_execute(sql: str, params: tuple = (), fetch: str = "none"):
+    """Simple helper for single-statement DB ops. Opens, executes, commits, closes.
+    fetch: 'none' (default), 'one', 'all'."""
+    with db_connection() as conn:
+        cursor = conn.execute(sql, params)
+        if fetch == "one":
+            return cursor.fetchone()
+        elif fetch == "all":
+            return cursor.fetchall()
+        return cursor
+
+def init_db():
+    with db_connection() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_address TEXT NOT NULL, symbol TEXT,
+            trade_number INTEGER DEFAULT 1, alert_grade TEXT,
+            entry_price REAL, entry_time REAL, entry_liquidity REAL, entry_tx TEXT,
+            exit_price REAL, exit_time REAL, exit_reason TEXT, exit_tx TEXT,
+            peak_price REAL, pnl_sol REAL, pnl_pct REAL,
+            position_size_sol REAL, remaining_pct REAL DEFAULT 1.0,
+            progressive_sold TEXT DEFAULT '[]', progressive_banked_sol REAL DEFAULT 0,
+            status TEXT DEFAULT 'open', tokens_held REAL DEFAULT 0,
+            entry_liq_usd REAL DEFAULT 0, top1_pct REAL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS token_history (
+            token_address TEXT PRIMARY KEY, detected_at REAL,
+            symbol TEXT, grade TEXT, top1_pct REAL,
+            entry_price_at_35s REAL, first_price REAL,
+            liquidity_usd REAL, traded INTEGER DEFAULT 0,
+            creator TEXT, rejection_reason TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS circuit_breaker (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            daily_pnl REAL DEFAULT 0, hourly_pnl REAL DEFAULT 0,
+            consecutive_losses INTEGER DEFAULT 0,
+            last_hour_reset REAL, last_day_reset REAL,
+            paused INTEGER DEFAULT 0, pause_reason TEXT
+        )""")
+        conn.execute("""INSERT OR IGNORE INTO circuit_breaker
+            (id, daily_pnl, hourly_pnl, consecutive_losses, last_hour_reset, last_day_reset, paused)
+            VALUES (1, 0, 0, 0, ?, ?, 0)""", (time.time(), time.time()))
+    log.info("Database initialized")
+
+# ============================================================
+# JUPITER SWAP ENGINE
+# ============================================================
+
+class JupiterSwap:
+    def __init__(self, keypair: Keypair, rpc_url: str):
+        self.keypair = keypair
+        self.rpc_url = rpc_url
+        self.wallet_pubkey = str(keypair.pubkey())
+        log.info(f"Wallet: {self.wallet_pubkey}")
+
+    def _headers(self) -> dict:
+        return {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+
+    async def get_quote(self, input_mint: str, output_mint: str,
+                        amount_lamports: int, slippage_bps: int = 1500) -> Optional[dict]:
+        try:
+            params = {
+                "inputMint": input_mint, "outputMint": output_mint,
+                "amount": str(amount_lamports), "slippageBps": str(slippage_bps),
+                "onlyDirectRoutes": "false", "restrictIntermediateTokens": "true",
+            }
+            session = await _get_rpc_session()
+            async with session.get(JUPITER_QUOTE_URL, params=params,
+                                  headers=self._headers(),
+                                  timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                body = await resp.text()
+                log.error(f"Quote failed ({resp.status}): {body[:200]}")
+                return None
+        except Exception as e:
+            log.error(f"Quote error: {e}")
+            return None
+
+    async def execute_swap(self, quote: dict) -> Optional[str]:
+        try:
+            swap_body = {
+                "quoteResponse": quote,
+                "userPublicKey": self.wallet_pubkey,
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "dynamicSlippage": True,
+                "prioritizationFeeLamports": {
+                    "priorityLevelWithMaxLamports": {
+                        "maxLamports": PRIORITY_FEE_LAMPORTS,
+                        "priorityLevel": "veryHigh"
+                    }
+                },
+            }
+            session = await _get_rpc_session()
+            async with session.post(JUPITER_SWAP_URL, json=swap_body,
+                                   headers=self._headers(),
+                                   timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.error(f"Swap API failed ({resp.status}): {body[:200]}")
+                    return None
+                data = await resp.json()
+
+            swap_tx_b64 = data.get("swapTransaction")
+            if not swap_tx_b64:
+                log.error("No swapTransaction in response")
+                return None
+
+            raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_tx_b64))
+            signature = self.keypair.sign_message(
+                solders_message.to_bytes_versioned(raw_tx.message)
+            )
+            signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+
+            tx_sig = await send_raw_tx(bytes(signed_tx))
+            if not tx_sig:
+                return None
+
+            log.info(f"TX sent: {tx_sig[:24]}...")
+            confirmed = await confirm_tx(tx_sig)
+            if not confirmed:
+                log.warning(f"TX FAILED on-chain: {tx_sig[:24]}...")
+                return None  # Return None so caller knows TX failed
+            return tx_sig
+        except Exception as e:
+            log.error(f"Swap error: {e}\n{traceback.format_exc()}")
+            return None
+
+    async def buy_token(self, token_mint: str, sol_amount: float,
+                        slippage_bps: int = 2000) -> Tuple[Optional[str], int]:
+        amount_lamports = int(sol_amount * LAMPORTS_PER_SOL)
+        log.info(f"BUY {sol_amount} SOL -> {token_mint[:16]}... (slippage {slippage_bps}bps)")
+
+        quote = await self.get_quote(SOL_MINT, token_mint, amount_lamports, slippage_bps)
+        if not quote:
+            return None, 0
+
+        out_amount = int(quote.get("outAmount", 0))
+        log.info(f"  Quote: {out_amount:,} tokens expected")
+
+        tx_sig = await self.execute_swap(quote)
+        if not tx_sig:
+            return None, 0
+
+        await asyncio.sleep(3)
+        actual = await get_token_balance(self.wallet_pubkey, token_mint)
+        if actual > 0:
+            log.info(f"  Balance: {actual:,} tokens")
+            return tx_sig, actual
+        else:
+            log.warning(f"  Balance check returned 0, using quote: {out_amount:,}")
+            return tx_sig, out_amount
+
+    async def sell_token(self, token_mint: str, token_amount: int,
+                         slippage_bps: int = 3500) -> Optional[str]:
+        """v4.3: Single attempt per call — no internal retry loop.
+        Retries happen across monitor cycles via sell_attempts counter.
+        This prevents blocking the monitor for 30-90s during retries."""
+        if token_amount <= 0:
+            return None
+        log.info(f"SELL: {token_amount:,} of {token_mint[:16]}... (slippage {slippage_bps}bps)")
+        quote = await self.get_quote(token_mint, SOL_MINT, token_amount, slippage_bps)
+        if not quote:
+            log.warning(f"SELL quote failed for {token_mint[:16]}")
+            return None
+        result = await self.execute_swap(quote)
+        if not result:
+            log.warning(f"SELL swap failed for {token_mint[:16]}")
+        return result
+
+    async def emergency_sell(self, token_mint: str, token_amount: int) -> Optional[str]:
+        log.warning(f"EMERGENCY SELL {token_mint[:16]}...")
+        return await self.sell_token(token_mint, token_amount, slippage_bps=5000)
+
+    async def check_sellable(self, token_mint: str, token_amount: int) -> bool:
+        """v4.3: Honeypot check — can we get a sell quote? If not, token is unsellable.
+        Uses 10% of token amount to avoid false positives on thin pools."""
+        if token_amount <= 0:
+            return False
+        # Check with small amount to avoid false positive on thin liquidity
+        check_amount = max(token_amount // 10, 1)
+        quote = await self.get_quote(token_mint, SOL_MINT, check_amount, 5000)
+        if quote:
+            out_amount = int(quote.get("outAmount", 0))
+            if out_amount > 0:
+                return True
+            log.warning(f"Honeypot check: quote returned 0 outAmount for {token_mint[:16]}")
+            return False
+        log.warning(f"Honeypot check: no quote for {token_mint[:16]} — likely honeypot")
+        return False
+
+# ============================================================
+# MARKET DATA (3 sources)
+# ============================================================
+
+class MarketData:
+    def __init__(self):
+        self.session = None
+
+    async def init_session(self):
+        self.session = aiohttp.ClientSession()
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
+    async def get_graduated_tokens(self) -> List[dict]:
+        try:
+            async with self.session.get(PUMPFUN_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, list) else []
+                return []
+        except Exception as e:
+            log.error(f"Pump.fun graduated error: {e}")
+            return []
+
+    async def get_live_tokens(self) -> List[dict]:
+        try:
+            async with self.session.get(PUMPFUN_LIVE_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, list) else []
+                return []
+        except Exception as e:
+            log.error(f"Pump.fun live error: {e}")
+            return []
+
+    async def get_gecko_pools(self) -> List[dict]:
+        try:
+            async with self.session.get(GECKO_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    result = []
+                    for p in data.get("data", []):
+                        base = p.get("relationships", {}).get("base_token", {}).get("data", {})
+                        addr = base.get("id", "").replace("solana_", "") if base else ""
+                        if addr:
+                            name = p.get("attributes", {}).get("name", "?").split("/")[0].strip()
+                            result.append({"mint": addr, "symbol": name, "source": "gecko"})
+                    return result
+                return []
+        except Exception as e:
+            log.error(f"GeckoTerminal error: {e}")
+            return []
+
+    async def get_token_data(self, addresses: List[str]) -> Dict[str, dict]:
+        if not addresses:
+            return {}
+        try:
+            url = f"{DEXSCREENER_URL}/{','.join(addresses[:30])}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs") or []
+                    result = {}
+                    for pair in pairs:
+                        addr = pair.get("baseToken", {}).get("address", "")
+                        if addr and addr not in result:
+                            result[addr] = pair
+                    return result
+                return {}
+        except Exception as e:
+            log.error(f"DexScreener error: {e}")
+            return {}
+
+    async def get_token_price_and_liq(self, address: str) -> Tuple[float, float]:
+        data = await self.get_token_data([address])
+        if address in data:
+            pair = data[address]
+            price = float(pair.get("priceUsd", 0) or 0)
+            liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+            return price, liq
+        return 0, 0
+
+# ============================================================
+# POSITION MANAGER
+# ============================================================
+
+class PositionManager:
+    def __init__(self, jupiter: JupiterSwap, market: MarketData):
+        self.jupiter = jupiter
+        self.market = market
+        self.lock = Lock()
+        self._open_positions: Dict[int, dict] = {}
+
+    def load_open_positions(self):
+        with db_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM trades WHERE status = 'open'").fetchall()
+            for row in rows:
+                pos = dict(row)
+                pos["ladder_levels_hit"] = set()
+                pos["emergency_retries"] = 0
+                pos["sell_attempts"] = 0
+                pos["zero_price_count"] = 0
+                pos["pending_exit"] = None  # v4.4: for failed sell retry (Fix #4)
+                try:
+                    pos["progressive_sold"] = json.loads(pos.get("progressive_sold", "[]"))
+                except:
+                    pos["progressive_sold"] = []
+                self._open_positions[row["id"]] = pos
+        log.info(f"Loaded {len(self._open_positions)} open positions")
+
+    @property
+    def open_count(self) -> int:
+        return len(self._open_positions)
+
+    def get_token_trade_count(self, token_address: str) -> int:
+        row = db_execute(
+            "SELECT COUNT(*) FROM trades WHERE token_address = ?",
+            (token_address,), fetch="one"
+        )
+        return row[0] if row else 0
+
+    def is_token_open(self, token_address: str) -> bool:
+        return any(p["token_address"] == token_address for p in self._open_positions.values())
+
+    async def open_position(self, token_address: str, symbol: str, grade: str,
+                           entry_liq: float, entry_price: float, top1: float = 0) -> Optional[int]:
+        # Live test mode: max 5 positions
+        max_pos = MAX_POSITIONS
+        if self.open_count >= max_pos:
+            return None
+        if self.get_token_trade_count(token_address) >= MAX_TRADES_PER_TOKEN:
+            return None
+        if self.is_token_open(token_address):
+            return None
+        if self._is_circuit_broken():
+            log.warning(f"Circuit breaker active, skipping {symbol}")
+            return None
+
+        log.info(f"OPENING {grade}-grade: {symbol} ({token_address[:16]}...) liq=${entry_liq:,.0f} top1={top1:.1f}%")
+
+        if SHADOW_MODE:
+            log.info(f"SHADOW BUY: {symbol} (no real trade)")
+            tg_send(f"SHADOW BUY {grade} | {symbol} | ${entry_price:.8f} | Liq: ${entry_liq:,.0f} | Top1: {top1:.0f}%")
+            tx_sig = "SHADOW"
+            tokens_held = int((POSITION_SIZE_SOL * 94) / entry_price) if entry_price > 0 else 1000000
+        else:
+            # LIVE SAFETY CHECKS
+            can, reason = safety_tracker.can_trade()
+            if not can:
+                log.warning(f"SAFETY BLOCK: {symbol} — {reason}")
+                tg_send(f"SAFETY BLOCK: {symbol} — {reason}")
+                return None
+            
+            # Check wallet balance
+            wallet_bal = await get_sol_balance(self.jupiter.wallet_pubkey)
+            if wallet_bal < POSITION_SIZE_SOL + MIN_WALLET_RESERVE_SOL:
+                log.warning(f"LOW BALANCE: {wallet_bal:.4f} SOL — need {POSITION_SIZE_SOL + MIN_WALLET_RESERVE_SOL:.4f}")
+                tg_send(f"LOW BALANCE: {wallet_bal:.4f} SOL — skipping {symbol}")
+                return None
+            
+            # Execute buy
+            tx_sig, tokens_held = await self.jupiter.buy_token(token_address, POSITION_SIZE_SOL)
+            
+            if tx_sig:
+                safety_tracker.record_buy(POSITION_SIZE_SOL)
+
+                # v4.3: Honeypot check — verify we can sell BEFORE committing
+                # v4.4-prod Fix #1: Entire honeypot section wrapped in try/except
+                # so a buy is NEVER orphaned without a DB record
+                if tokens_held > 0:
+                    try:
+                        try:
+                            sellable = await self.jupiter.check_sellable(token_address, tokens_held)
+                        except Exception as e:
+                            log.warning(f"Honeypot check failed for {symbol}: {e} — assuming sellable")
+                            sellable = True  # Assume sellable on API error, don't orphan the trade
+                        if not sellable:
+                            log.warning(f"HONEYPOT DETECTED: {symbol} — cannot get sell quote! Attempting emergency dump.")
+                            tg_send(f"HONEYPOT: {symbol} — can't sell! Attempting dump...")
+                            # Try to sell immediately
+                            dump_tx = await self.jupiter.sell_token(token_address, tokens_held, 5000)
+                            if dump_tx:
+                                tg_send(f"HONEYPOT DUMP OK: {symbol} — sold immediately")
+                                # Record as closed trade so it shows on dashboard
+                                with db_connection() as conn:
+                                    conn.execute("""INSERT INTO trades
+                                        (token_address, symbol, trade_number, alert_grade, entry_price, entry_time,
+                                         entry_liquidity, entry_tx, exit_price, exit_time, exit_reason, exit_tx,
+                                         peak_price, pnl_sol, pnl_pct, position_size_sol, status,
+                                         tokens_held, entry_liq_usd, top1_pct)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed',
+                                                ?, ?, ?)""",
+                                        (token_address, symbol, 1, grade, entry_price, time.time(),
+                                         entry_liq, tx_sig, entry_price, time.time(), "HONEYPOT_DUMPED", dump_tx,
+                                         entry_price, -0.005, -25, POSITION_SIZE_SOL,
+                                         tokens_held, entry_liq, top1))
+                            else:
+                                tg_send(f"HONEYPOT STUCK: {symbol} — tokens unsellable. Total loss.")
+                                # Record as closed total loss
+                                with db_connection() as conn:
+                                    conn.execute("""INSERT INTO trades
+                                        (token_address, symbol, trade_number, alert_grade, entry_price, entry_time,
+                                         entry_liquidity, entry_tx, exit_price, exit_time, exit_reason, exit_tx,
+                                         peak_price, pnl_sol, pnl_pct, position_size_sol, status,
+                                         tokens_held, entry_liq_usd, top1_pct)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed',
+                                                ?, ?, ?)""",
+                                        (token_address, symbol, 1, grade, entry_price, time.time(),
+                                         entry_liq, tx_sig, 0, time.time(), "HONEYPOT_STUCK", "NONE",
+                                         entry_price, -POSITION_SIZE_SOL, -100, POSITION_SIZE_SOL,
+                                         tokens_held, entry_liq, top1))
+                            return None
+                    except Exception as hp_err:
+                        # v4.4-prod Fix #1: On ANY exception in honeypot block,
+                        # record the trade in DB as HONEYPOT_ERROR so it's never orphaned
+                        log.error(f"HONEYPOT BLOCK EXCEPTION for {symbol}: {hp_err}\n{traceback.format_exc()}")
+                        tg_send(f"HONEYPOT ERROR: {symbol} — exception during check: {hp_err}")
+                        try:
+                            with db_connection() as conn:
+                                conn.execute("""INSERT INTO trades
+                                    (token_address, symbol, trade_number, alert_grade, entry_price, entry_time,
+                                     entry_liquidity, entry_tx, exit_price, exit_time, exit_reason, exit_tx,
+                                     peak_price, pnl_sol, pnl_pct, position_size_sol, status,
+                                     tokens_held, entry_liq_usd, top1_pct)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed',
+                                            ?, ?, ?)""",
+                                    (token_address, symbol, 1, grade, entry_price, time.time(),
+                                     entry_liq, tx_sig, 0, time.time(), "HONEYPOT_ERROR", "NONE",
+                                     entry_price, -POSITION_SIZE_SOL, -100, POSITION_SIZE_SOL,
+                                     tokens_held, entry_liq, top1))
+                        except Exception as db_err:
+                            log.error(f"CRITICAL: Could not record honeypot error for {symbol}: {db_err}")
+                        return None
+
+                # Verify tokens received
+                if tokens_held == 0:
+                    log.warning(f"BUY executed but 0 tokens received for {symbol} — TX may have failed")
+                    tg_send(f"WARNING: BUY TX sent but 0 tokens for {symbol}\nTX: {tx_sig[:24]}...\nCheck Solscan!")
+                else:
+                    solscan = f"https://solscan.io/tx/{tx_sig}"
+                    tg_send(f"BUY {grade} | {symbol}\nPrice: ${entry_price:.8f}\nLiq: ${entry_liq:,.0f}\nTokens: {tokens_held:,}\nTX: {solscan}")
+
+        if not tx_sig:
+            log.warning(f"BUY failed for {symbol}")
+            tg_send(f"BUY FAILED: {symbol} ({grade})")
+            return None
+
+        trade_count = self.get_token_trade_count(token_address)
+
+        # v4.4-prod Fix #2: Atomic DB insert + dict update.
+        # If dict update fails after DB insert, immediately close the DB record
+        # so it's never orphaned as a phantom open position.
+        try:
+            with db_connection() as conn:
+                cursor = conn.execute("""INSERT INTO trades
+                    (token_address, symbol, trade_number, alert_grade, entry_price, entry_time,
+                     entry_liquidity, entry_tx, peak_price, position_size_sol, tokens_held,
+                     entry_liq_usd, top1_pct, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
+                    (token_address, symbol, trade_count + 1, grade, entry_price, time.time(),
+                     entry_liq, tx_sig, entry_price, POSITION_SIZE_SOL, tokens_held, entry_liq, top1))
+                trade_id = cursor.lastrowid
+        except Exception as db_err:
+            log.error(f"DB INSERT failed for {symbol}: {db_err}")
+            tg_send(f"DB ERROR: Could not record buy for {symbol}")
+            return None
+
+        pos = {
+            "id": trade_id, "token_address": token_address, "symbol": symbol,
+            "trade_number": trade_count + 1, "alert_grade": grade,
+            "entry_price": entry_price, "entry_time": time.time(),
+            "entry_liq_usd": entry_liq, "entry_tx": tx_sig,
+            "peak_price": entry_price, "position_size_sol": POSITION_SIZE_SOL,
+            "tokens_held": tokens_held, "remaining_pct": 1.0,
+            "progressive_sold": [], "progressive_banked_sol": 0,
+            "ladder_levels_hit": set(), "emergency_retries": 0,
+            "sell_attempts": 0, "zero_price_count": 0,
+            "pending_exit": None,  # v4.4: for failed sell retry (Fix #4)
+        }
+        try:
+            with self.lock:
+                self._open_positions[trade_id] = pos
+        except Exception as dict_err:
+            # v4.4-prod Fix #2: Dict update failed — close the DB record immediately
+            log.error(f"Dict update failed for {symbol} #{trade_id}: {dict_err}")
             try:
-                trade_num = t["trade_number"] or 1
-            except (KeyError, IndexError):
-                trade_num = 1
-            tag = f" #{trade_num}" if trade_num > 1 else ""
-            rows += f"""<tr>
-                <td>{t['symbol']}{tag}</td>
-                <td><span class="badge {grade_class}">{t['alert_grade']}</span></td>
-                <td>${t['entry_price']:.6f}</td><td>${curr:.6f}</td>
-                <td class="{pclass}">{gain:+.1f}%</td><td>{age:.0f}s</td>
-                <td>{remaining*100:.0f}%</td><td>{banked:+.4f}</td>
-                <td>${t['entry_liquidity']:.0f}</td>
-            </tr>"""
-        open_table = f"""<table><tr><th>Token</th><th>Grade</th><th>Entry</th><th>Current</th>
-            <th>P&L</th><th>Age</th><th>Remaining</th><th>Banked</th><th>Liq</th></tr>{rows}</table>"""
-    else:
-        open_table = '<div class="empty">No open positions</div>'
+                db_execute(
+                    "UPDATE trades SET status='closed', exit_reason='OPEN_FAILED', exit_time=? WHERE id=?",
+                    (time.time(), trade_id)
+                )
+            except Exception:
+                pass
+            tg_send(f"OPEN_FAILED: {symbol} #{trade_id} — position closed in DB")
+            return None
 
-    if closed[:20]:
-        rows = ""
-        for t in closed[:20]:
-            pclass = "pnl-pos" if t["pnl_sol"] >= 0 else "pnl-neg"
-            grade_class = f"badge-{t['alert_grade'].lower()}" if t['alert_grade'] else "badge-c"
-            hold = t["exit_time"] - t["entry_time"] if t["exit_time"] and t["entry_time"] else 0
-            ts_str = datetime.fromtimestamp(t["entry_time"], tz=timezone.utc).strftime("%H:%M:%S") if t["entry_time"] else ""
+        log.info(f"OPENED #{trade_id}: {symbol} ({grade}) | {tokens_held:,} tokens")
+        return trade_id
+
+    async def close_position(self, trade_id: int, reason: str,
+                            exit_price: float, emergency: bool = False):
+        with self.lock:
+            pos = self._open_positions.get(trade_id)
+            if not pos:
+                return
+
+        symbol = pos["symbol"]
+
+        # v4.3: If bot is halted, don't attempt sells — just finalize as failed
+        if not SHADOW_MODE and safety_tracker.halted:
+            log.warning(f"BOT HALTED — auto-closing {symbol} as failed (no sell attempt)")
+            self._finalize_close(trade_id, pos, f"{reason}_BOT_HALTED", exit_price, None, emergency=True)
+            return
+
+        # v4.3: Track sell attempts per position
+        sell_attempts = pos.get("sell_attempts", 0)
+        if not SHADOW_MODE and sell_attempts >= MAX_SELL_ATTEMPTS_PER_POSITION:
+            log.warning(f"Max sell attempts ({MAX_SELL_ATTEMPTS_PER_POSITION}) reached for {symbol} — auto-closing as failed")
+            tg_send(f"SELL GAVE UP: {symbol} after {sell_attempts} attempts — closing as total loss")
+            self._finalize_close(trade_id, pos, f"{reason}_SELL_MAXED", exit_price, None, emergency=True)
+            return
+
+        tokens_to_sell = int(pos["tokens_held"] * pos["remaining_pct"])
+
+        # LIVE: check actual on-chain balance instead of estimate
+        if not SHADOW_MODE:
+            actual_balance = await get_token_balance(self.jupiter.wallet_pubkey, pos["token_address"])
+            if actual_balance > 0:
+                tokens_to_sell = actual_balance
+                log.info(f"Actual on-chain balance for {symbol}: {actual_balance:,}")
+            elif tokens_to_sell > 0:
+                log.warning(f"On-chain balance 0 for {symbol}, using estimate: {tokens_to_sell:,}")
+
+        if tokens_to_sell <= 0:
+            self._finalize_close(trade_id, pos, reason, exit_price, None, emergency=True)
+            return
+
+        if emergency:
+            retries = pos.get("emergency_retries", 0)
+            if retries >= MAX_EMERGENCY_RETRIES:
+                log.warning(f"Emergency max retries for {symbol}, total loss")
+                self._finalize_close(trade_id, pos, f"{reason}_SELL_FAILED", exit_price, None, emergency=True)
+                return
+            with self.lock:
+                pos["emergency_retries"] = retries + 1
+
+        if SHADOW_MODE:
+            tx_sig = "SHADOW"
+            log.info(f"SHADOW SELL: {symbol} ({reason})")
+        else:
+            # v4.3: ALL sells check pool liquidity first (not just emergency)
+            # But distinguish API failure (0,0) from real drain
+            pool_price, current_liq = await self.market.get_token_price_and_liq(pos["token_address"])
+            if current_liq < 100 and pool_price > 0:
+                # Price exists but liq gone = real pool drain
+                log.warning(f"Pool drained for {symbol} (liq=${current_liq:.0f}, price=${pool_price:.8f}) — auto-closing as total loss")
+                self._finalize_close(trade_id, pos, f"{reason}_POOL_DRAINED", exit_price, None, emergency=True)
+                return
+            elif current_liq == 0 and pool_price == 0:
+                # Both zero = likely API failure, NOT pool drain
+                # Still try to sell — let Jupiter figure it out
+                log.warning(f"DexScreener returned 0/0 for {symbol} — API issue? Attempting sell anyway.")
+
+            # Track attempt
+            with self.lock:
+                pos["sell_attempts"] = sell_attempts + 1
+
+            # v4.3: Escalate slippage across attempts (not inside sell_token)
+            slippage_schedule = [3500, 4500, 5000]
+            slip = slippage_schedule[min(sell_attempts, len(slippage_schedule) - 1)]
+
+            if emergency:
+                slip = 5000  # Always max slippage for emergency
+                tx_sig = await self.jupiter.sell_token(pos["token_address"], tokens_to_sell, slip)
+            else:
+                tx_sig = await self.jupiter.sell_token(pos["token_address"], tokens_to_sell, slip)
+
+            if tx_sig:
+                safety_tracker.record_sell_success()
+                # v4.4-prod Fix #4: Clear pending exit on successful sell
+                with self.lock:
+                    pos["pending_exit"] = None
+                solscan = f"https://solscan.io/tx/{tx_sig}"
+                prefix = "EMERGENCY SELL" if emergency else "SELL"
+                tg_send(f"{prefix} | {symbol}\nReason: {reason}\nTX: {solscan}")
+            else:
+                safety_tracker.record_sell_failure()
+                # v4.4-prod Fix #4: Store pending exit so it retries regardless of price recovery
+                with self.lock:
+                    pending = pos.get("pending_exit")
+                    attempt = (pending.get("attempts", 0) if pending else 0) + 1
+                    if attempt >= MAX_SELL_ATTEMPTS_PER_POSITION:
+                        log.warning(f"Pending exit max attempts for {symbol} — giving up")
+                        tg_send(f"SELL GAVE UP: {symbol} after {attempt} pending attempts")
+                        pos["pending_exit"] = None
+                        # Fall through to finalize below
+                    else:
+                        pos["pending_exit"] = {
+                            "reason": reason,
+                            "price": exit_price if hasattr(self, '_monitor_price') else 0,
+                            "attempts": attempt,
+                            "emergency": emergency,
+                        }
+                log.error(f"SELL FAILED for {symbol} ({reason}) — attempt {sell_attempts + 1}/{MAX_SELL_ATTEMPTS_PER_POSITION}")
+                tg_send(f"SELL FAILED: {symbol} ({reason}) — attempt {sell_attempts + 1}/{MAX_SELL_ATTEMPTS_PER_POSITION}")
+                # Check if we hit max pending attempts and need to force-close
+                if pos.get("pending_exit") is not None:
+                    return  # Will retry on next monitor cycle
+                # pending_exit was cleared = max attempts reached, finalize as total loss
+                self._finalize_close(trade_id, pos, f"{reason}_SELL_MAXED", exit_price, None, emergency=True)
+                return
+
+        if not tx_sig and emergency:
+            retries = pos.get("emergency_retries", 0)
+            if retries >= MAX_EMERGENCY_RETRIES:
+                self._finalize_close(trade_id, pos, f"{reason}_SELL_FAILED", exit_price, None, emergency=True)
+            return
+
+        self._finalize_close(trade_id, pos, reason, exit_price, tx_sig, emergency)
+
+    def _finalize_close(self, trade_id: int, pos: dict, reason: str,
+                       exit_price: float, tx_sig: Optional[str], emergency: bool = False):
+        entry_price = pos["entry_price"]
+        banked = pos.get("progressive_banked_sol", 0)
+        remaining = pos["remaining_pct"]
+        pos_size = pos.get("position_size_sol", POSITION_SIZE_SOL)  # v4.3: use per-trade size
+
+        # REALITY MODE: emergency exits = ALWAYS total loss on remaining
+        if emergency or not tx_sig:
+            pnl_sol = banked - (pos_size * remaining)
+        else:
+            pnl_pct = ((exit_price / entry_price) - 1) * 100 if entry_price else 0
+            pnl_sol = banked + (pos_size * remaining * (pnl_pct / 100))
+
+        pnl_pct_total = ((pnl_sol / pos_size) * 100) if pos_size else 0
+
+        conn = get_db()
+        try:
+            conn.execute("""UPDATE trades SET exit_price=?, exit_time=?, exit_reason=?,
+                exit_tx=?, pnl_sol=?, pnl_pct=?, status='closed', peak_price=?,
+                remaining_pct=?, progressive_sold=?, progressive_banked_sol=?
+                WHERE id=?""",
+                (exit_price, time.time(), reason, tx_sig or "NONE", pnl_sol, pnl_pct_total,
+                 pos["peak_price"], remaining, json.dumps(pos.get("progressive_sold", [])),
+                 banked, trade_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        self._update_circuit_breaker(pnl_sol)
+
+        with self.lock:
+            self._open_positions.pop(trade_id, None)
+
+        symbol = pos["symbol"]
+        emoji = "+" if pnl_sol >= 0 else ""
+        hold = time.time() - pos["entry_time"]
+        peak_pct = ((pos["peak_price"] / entry_price) - 1) * 100 if entry_price else 0
+
+        tg_send(
+            f"{'EMERGENCY ' if emergency else ''}SELL | {symbol}\n"
+            f"Reason: {reason}\nPnL: {emoji}{pnl_sol:.4f} SOL ({emoji}{pnl_pct_total:.0f}%)\n"
+            f"Hold: {hold:.0f}s | Peak: +{peak_pct:.0f}%"
+        )
+        log.info(f"CLOSED #{trade_id}: {symbol} | {reason} | PnL: {pnl_sol:+.4f} SOL ({pnl_pct_total:+.0f}%)")
+
+    async def execute_ladder_sell(self, trade_id: int, threshold_pct: float,
+                                  sell_fraction: float, current_price: float):
+        with self.lock:
+            pos = self._open_positions.get(trade_id)
+            if not pos:
+                return
+
+        # v4.3: Use actual on-chain balance for ladder sells too
+        if not SHADOW_MODE:
+            actual_balance = await get_token_balance(self.jupiter.wallet_pubkey, pos["token_address"])
+            if actual_balance > 0:
+                # v4.4-prod Fix #6: Sell fraction of ORIGINAL position, capped at actual balance.
+                # pos["tokens_held"] is the original token count from buy.
+                # sell_fraction is the fraction of the original position to sell.
+                tokens_to_sell = min(int(pos["tokens_held"] * sell_fraction), actual_balance)
+            else:
+                tokens_to_sell = int(pos["tokens_held"] * sell_fraction)
+        else:
+            tokens_to_sell = int(pos["tokens_held"] * sell_fraction)
+        if tokens_to_sell <= 0:
+            return
+
+        if SHADOW_MODE:
+            tx_sig = "SHADOW"
+        else:
+            # v4.3: Check pool before ladder sell
+            _, current_liq = await self.market.get_token_price_and_liq(pos["token_address"])
+            if current_liq < 100:
+                log.warning(f"Pool drained during ladder sell for {pos['symbol']} — skipping")
+                with self.lock:
+                    pos["ladder_levels_hit"].add(threshold_pct)  # Mark as hit so we don't retry
+                return
+            tx_sig = await self.jupiter.sell_token(pos["token_address"], tokens_to_sell, 2500)
+
+        if tx_sig:
+            entry_price = pos["entry_price"]
+            pos_size = pos.get("position_size_sol", POSITION_SIZE_SOL)
+            sol_received = pos_size * sell_fraction * (current_price / entry_price) if entry_price else 0
+            with self.lock:
+                pos["remaining_pct"] -= sell_fraction
+                pos["progressive_banked_sol"] += sol_received
+                pos["progressive_sold"].append({
+                    "threshold": threshold_pct, "pct": sell_fraction,
+                    "price": current_price, "sol": sol_received,
+                })
+                pos["ladder_levels_hit"].add(threshold_pct)
+            log.info(f"LADDER #{trade_id} {pos['symbol']}: {sell_fraction*100:.0f}% at +{threshold_pct:.0f}%")
+            tg_send(f"LADDER {pos['symbol']}: sold {sell_fraction*100:.0f}% at +{threshold_pct:.0f}%")
+        else:
+            # v4.3: Mark level as hit even on failure — prevents infinite retry loop
+            log.warning(f"LADDER SELL FAILED for {pos['symbol']} at +{threshold_pct:.0f}% — marking level to prevent retry")
+            with self.lock:
+                pos["ladder_levels_hit"].add(threshold_pct)
+            tg_send(f"LADDER FAIL: {pos['symbol']} at +{threshold_pct:.0f}% — skipped")
+
+    def _is_circuit_broken(self) -> bool:
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT * FROM circuit_breaker WHERE id = 1").fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return False
+        now = time.time()
+        if now - (row[4] or 0) > 3600:
+            db_execute("UPDATE circuit_breaker SET hourly_pnl=0, last_hour_reset=? WHERE id=1", (now,))
+        if now - (row[5] or 0) > 86400:
+            db_execute("UPDATE circuit_breaker SET daily_pnl=0, last_day_reset=?, paused=0 WHERE id=1", (now,))
+        return bool(row[6])
+
+    def _update_circuit_breaker(self, pnl_sol: float):
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT * FROM circuit_breaker WHERE id = 1").fetchone()
+            new_daily = (row[1] or 0) + pnl_sol
+            new_hourly = (row[2] or 0) + pnl_sol
+            new_consec = 0 if pnl_sol > 0 else (row[3] or 0) + 1
+            paused, reason = 0, None
+            if new_daily <= -MAX_DAILY_LOSS_SOL:
+                paused, reason = 1, f"Daily loss: {new_daily:.4f}"
+            elif new_hourly <= -MAX_HOURLY_LOSS_SOL:
+                paused, reason = 1, f"Hourly loss: {new_hourly:.4f}"
+            elif new_consec >= MAX_CONSECUTIVE_LOSSES:
+                paused, reason = 1, f"Consecutive: {new_consec}"
+            conn.execute("""UPDATE circuit_breaker SET daily_pnl=?, hourly_pnl=?,
+                consecutive_losses=?, paused=?, pause_reason=? WHERE id=1""",
+                (new_daily, new_hourly, new_consec, paused, reason))
+            conn.commit()
+        finally:
+            conn.close()
+        if paused:
+            log.warning(f"CIRCUIT BREAKER: {reason}")
+            tg_send(f"CIRCUIT BREAKER: {reason}\nBot paused.")
+
+# ============================================================
+# MAIN BOT
+# ============================================================
+
+class WaveRiderBot:
+    def __init__(self):
+        if not PRIVATE_KEY:
+            raise ValueError("PRIVATE_KEY not set")
+        if not RPC_URL:
+            raise ValueError("RPC_URL not set")
+        if not JUPITER_API_KEY:
+            raise ValueError("JUPITER_API_KEY not set")
+
+        self.keypair = Keypair.from_bytes(base58.b58decode(PRIVATE_KEY))
+        self.jupiter = JupiterSwap(self.keypair, RPC_URL)
+        self.market = MarketData()
+        self.positions = PositionManager(self.jupiter, self.market)
+        self.running = False
+        self._seen_tokens = set()
+        self._warmed_up = False
+        self._pending_tokens = {}
+        self._scan_count = 0
+
+    async def start(self):
+        log.info(f"=== Wave Rider Bot {VERSION} starting ===")
+        log.info(f"Shadow mode: {SHADOW_MODE}")
+        log.info(f"Liq gate: ${MIN_LIQ_ENTRY:,.0f} (all grades)")
+
+        init_db()
+        await self.market.init_session()
+        self.positions.load_open_positions()
+
+        sol = await get_sol_balance(self.jupiter.wallet_pubkey)
+        log.info(f"Balance: {sol:.4f} SOL (${sol * 94:.2f})")
+        tg_send(
+            f"Wave Rider {VERSION} started\n"
+            f"Mode: {'SHADOW' if SHADOW_MODE else 'LIVE'}\n"
+            f"Wallet: {self.jupiter.wallet_pubkey[:8]}...{self.jupiter.wallet_pubkey[-4:]}\n"
+            f"Balance: {sol:.4f} SOL\nSize: {POSITION_SIZE_SOL} SOL\n"
+            f"Liq gate: ${MIN_LIQ_ENTRY/1000:.0f}K (all grades)\n"
+            f"Enrichment: bundle+freeze+creator"
+        )
+
+        self.running = True
+        await asyncio.gather(
+            self._scanner_loop(),
+            self._monitor_loop(),
+            self._health_loop(),
+        )
+
+    async def _scanner_loop(self):
+        log.info("Scanner started (3 sources)")
+        while self.running:
             try:
-                rpnl = t["realistic_pnl_sol"] or 0
-            except (KeyError, IndexError):
-                rpnl = 0
-            rpclass = "pnl-pos" if rpnl >= 0 else "pnl-neg"
+                self._scan_count += 1
+
+                # Source 1: Graduated
+                tokens = await self.market.get_graduated_tokens()
+                grad_count = len(tokens)
+
+                # Source 2: Live
+                live_tokens = await self.market.get_live_tokens()
+                live_count = len(live_tokens)
+                for lt in live_tokens:
+                    addr = lt.get("mint", "")
+                    if addr and addr not in self._seen_tokens and addr not in self._pending_tokens:
+                        tokens.append(lt)
+
+                # Source 3: Gecko (every 6th scan ~30s)
+                gecko_count = 0
+                if self._scan_count % 6 == 0:
+                    gecko_tokens = await self.market.get_gecko_pools()
+                    gecko_count = len(gecko_tokens)
+                    for gt in gecko_tokens:
+                        addr = gt.get("mint", "")
+                        if addr and addr not in self._seen_tokens and addr not in self._pending_tokens:
+                            tokens.append(gt)
+
+                # Count new
+                new_count = sum(1 for t in tokens
+                    if t.get("mint", "") not in self._seen_tokens
+                    and t.get("mint", "") not in self._pending_tokens)
+
+                if new_count > 0 or len(self._pending_tokens) > 0:
+                    log.info(f"SCAN: grad={grad_count} live={live_count} gecko={gecko_count} | new={new_count} pending={len(self._pending_tokens)}")
+
+                # Process new tokens
+                for t in tokens:
+                    addr = t.get("mint", "")
+                    if not addr or addr in self._seen_tokens or addr in self._pending_tokens:
+                        continue
+                    self._seen_tokens.add(addr)
+
+                    # Warmup: skip first batch
+                    if not self._warmed_up:
+                        continue
+
+                    # Get first price
+                    dex_data = await self.market.get_token_data([addr])
+                    if addr not in dex_data:
+                        continue
+
+                    pair = dex_data[addr]
+                    first_price = float(pair.get("priceUsd", 0) or 0)
+                    first_liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+                    symbol = t.get("symbol", pair.get("baseToken", {}).get("symbol", "?"))
+
+                    if first_price <= 0:
+                        continue
+
+                    # v4.4 fix: Store token for pending, enrich LATER (after 35s delay)
+                    # V9.6 enriches at 25-90s, not at detection. Early enrichment causes
+                    # bundle false positives (early bundled buys dominate before organic trades).
+                    source = t.get("source", "pumpfun")  # gecko tokens have source="gecko"
+                    self._pending_tokens[addr] = {
+                        "pump_token": t, "first_price": first_price,
+                        "first_liq": first_liq, "detected_at": time.time(),
+                        "symbol": symbol, "holders": None,
+                        "bundle_detected": False, "bundle_count": 0,
+                        "freeze_authority": None, "mint_authority": None,
+                        "creator_prev_tokens": -1, "creator_addr": "",
+                        "enriched": False, "source": source,
+                    }
+
+                # Warmup complete after first scan
+                if not self._warmed_up:
+                    log.info(f"Warmup: skipped {len(self._seen_tokens)} existing tokens")
+                    self._warmed_up = True
+
+                # V9.6 ENRICHMENT: every 3rd scan, enrich 1 token aged 25-90s
+                if self._scan_count % 1 == 0:  # DATA COLLECTION: every scan cycle
+                    now_enrich = time.time()
+                    to_enrich = [(addr, info) for addr, info in self._pending_tokens.items()
+                                 if not info.get("enriched") 
+                                 and 10 <= now_enrich - info["detected_at"] <= 300
+                                 and info.get("first_liq", 0) >= MIN_LIQ_ENRICH]
+                    for addr, info in to_enrich[:5]:  # DATA COLLECTION: up to 5 per cycle
+                        try:
+                            symbol = info["symbol"]
+                            log.info(f"ENRICHING: {symbol} (V9.6 timing, age={now_enrich - info['detected_at']:.0f}s)")
+                            
+                            holders = await fetch_holder_concentration(addr)
+                            if holders:
+                                info["holders"] = holders
+                                log.info(f"  HOLDERS: {symbol} top1={holders['top1']:.1f}%")
+                            
+                            bundle_info = await fetch_bundle_info(addr)
+                            info["bundle_detected"] = bundle_info["bundle_detected"]
+                            info["bundle_count"] = bundle_info["bundle_count"]
+                            if bundle_info["bundle_detected"]:
+                                log.info(f"  BUNDLE: {symbol} detected ({bundle_info['bundle_count']} buys in block)")
+                            
+                            freeze_info = await check_freeze_authority(addr)
+                            if freeze_info:
+                                info["freeze_authority"] = freeze_info.get("freeze_authority")
+                                info["mint_authority"] = freeze_info.get("mint_authority")
+                                if freeze_info.get("freeze_authority"):
+                                    log.warning(f"  FREEZE: {symbol} has freeze authority!")
+                            
+                            creator_addr = info.get("pump_token", {}).get("creator", "")
+                            if creator_addr:
+                                creator_prev = await check_creator_history(creator_addr)
+                                info["creator_prev_tokens"] = creator_prev
+                                if creator_prev > 0:
+                                    log.warning(f"  CREATOR: {symbol} deployer has {creator_prev} other tokens")
+                            
+                            info["enriched"] = True
+                        except Exception as e:
+                            log.error(f"Enrichment error for {info.get('symbol','?')}: {e}")
+                            info["enriched"] = True  # Mark as done to avoid retry
+
+                # Check pending tokens: must be enriched AND 35s+ old
+                ready = []
+                for addr, info in list(self._pending_tokens.items()):
+                    age = time.time() - info["detected_at"]
+                    if age >= ENTRY_DELAY_SECONDS and info.get("enriched"):
+                        ready.append((addr, info))
+                        del self._pending_tokens[addr]
+                    elif age > 300:
+                        # DATA COLLECTION: extended from 90s to 300s
+                        del self._pending_tokens[addr]
+
+                if ready:
+                    addrs = [a for a, _ in ready]
+                    dex_data = await self.market.get_token_data(addrs)
+                    for addr, info in ready:
+                        if addr in dex_data:
+                            await self._evaluate(info, dex_data[addr])
+                        else:
+                            log.info(f"REJECT: {info['symbol']} -- no DexScreener data after 35s")
+                            self._record_rejection(addr, info["symbol"], "NO_DEX_DATA")
+
+            except Exception as e:
+                log.error(f"Scanner error: {e}\n{traceback.format_exc()}")
+
+            await asyncio.sleep(5)
+
+    async def _evaluate(self, info: dict, dex_pair: dict):
+        """V9.6-EXACT grading logic with kill signals, bundle detection, freeze authority."""
+        addr = info["pump_token"].get("mint", "")
+        symbol = info["symbol"]
+        first_price = info["first_price"]
+
+        current_price = float(dex_pair.get("priceUsd", 0) or 0)
+        current_liq = float(dex_pair.get("liquidity", {}).get("usd", 0) or 0)
+
+        if current_price <= 0:
+            self._record_rejection(addr, symbol, "NO_PRICE")
+            return
+
+        # Enrichment data (already populated by scanner enrichment cycle)
+        holders = info.get("holders")
+        bundle_detected = info.get("bundle_detected", False)
+        freeze_authority = info.get("freeze_authority", None)
+        creator_prev = info.get("creator_prev_tokens", -1)
+        curve_dur = info.get("pump_token", {}).get("curve_duration_sec", 0) or 0
+
+        # Price momentum (gain since first detection)
+        momentum = ((current_price / first_price) - 1) * 100 if first_price > 0 else 0
+
+        # Price glitch filter
+        if momentum > 10000:
+            log.info(f"REJECT: {symbol} GLITCH +{momentum:.0f}%")
+            self._record_rejection(addr, symbol, f"GLITCH_{momentum:.0f}pct")
+            return
+
+        # V9.6: Freeze authority = BLOCK (hard reject)
+        if freeze_authority:
+            log.info(f"REJECT: {symbol} FREEZE AUTHORITY — blocked")
+            self._record_rejection(addr, symbol, "FREEZE_AUTHORITY")
+            return
+
+        # V9.6: Liquidity gate — single $15K for all grades
+        if current_liq < MIN_LIQ_ENTRY:
+            log.info(f"REJECT: {symbol} liq=${current_liq:,.0f} < ${MIN_LIQ_ENTRY:,.0f}")
+            self._record_rejection(addr, symbol, f"LOW_LIQ_{current_liq:.0f}")
+            return
+
+        # --- V9.6 ENTRY FILTERS ---
+        top1 = holders["top1"] if holders else 0
+        top1_gte_99 = top1 >= 99
+        top1_gte_95 = top1 >= 95
+        price_up_5pct = momentum > 5
+
+        # --- DATA COLLECTION: Only kill guaranteed losses ---
+        kill = False
+        kill_reasons = []
+        # REMOVED: curve_dur > 300 (want data on slow graduations)
+        # REMOVED: momentum < -10 (want data on dumps)
+        # KEPT: serial creator (proven rugger)
+        if creator_prev >= 1:
+            kill = True
+            kill_reasons.append(f"serial_creator={creator_prev}")
+
+        if kill:
+            reason_str = ",".join(kill_reasons)
+            log.info(f"REJECT: {symbol} KILL SIGNAL: {reason_str}")
+            self._record_rejection(addr, symbol, f"KILL_{reason_str}")
+            return
+
+        # --- DATA COLLECTION: Accept everything with any positive movement ---
+        # Grade based on quality for analysis later
+        if top1_gte_99:
+            grade = "A"
+        elif top1 >= 90:
+            grade = "A-"
+        elif top1 >= 80:
+            grade = "B+"
+        elif top1 >= 50:
+            grade = "B"
+        else:
+            grade = "C"
+
+        log.info(f"SIGNAL {grade}: {symbol} top1={top1:.1f}% bundle={bundle_detected} momentum=+{momentum:.1f}% liq=${current_liq:,.0f}")
+
+        # Record in token_history
+        with db_connection() as conn:
+            conn.execute("""INSERT OR REPLACE INTO token_history
+                (token_address, detected_at, symbol, grade, top1_pct,
+                 entry_price_at_35s, first_price, liquidity_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (addr, time.time(), symbol, grade, top1, current_price, first_price, current_liq))
+
+        await self.positions.open_position(addr, symbol, grade, current_liq, current_price, top1)
+
+    def _record_rejection(self, addr: str, symbol: str, reason: str):
+        try:
+            with db_connection() as conn:
+                conn.execute("""INSERT OR REPLACE INTO token_history
+                    (token_address, detected_at, symbol, rejection_reason)
+                    VALUES (?, ?, ?, ?)""", (addr, time.time(), symbol, reason))
+        except:
+            pass
+
+    async def _monitor_loop(self):
+        log.info("Position monitor started")
+        while self.running:
             try:
-                trade_num = t["trade_number"] or 1
-            except (KeyError, IndexError):
-                trade_num = 1
-            tag = f" #{trade_num}" if trade_num > 1 else ""
+                positions = list(self.positions._open_positions.items())
+                if not positions:
+                    await asyncio.sleep(1)
+                    continue
+
+                addresses = list(set(p["token_address"] for _, p in positions))
+                dex_data = await self.market.get_token_data(addresses)
+
+                for trade_id, pos in positions:
+                    if trade_id not in self.positions._open_positions:
+                        continue
+
+                    addr = pos["token_address"]
+
+                    # v4.4-prod Fix #4: Check for pending exit from a previously failed sell.
+                    # If there's a pending exit, retry the sell regardless of current price conditions.
+                    pending = pos.get("pending_exit")
+                    if pending:
+                        log.info(f"RETRY pending exit for {pos['symbol']}: {pending['reason']} (attempt {pending['attempts']})")
+                        await self.positions.close_position(
+                            trade_id, pending["reason"],
+                            pending.get("price", 0),
+                            emergency=pending.get("emergency", False)
+                        )
+                        continue
+
+                    if addr not in dex_data:
+                        # v4.3: Even without price data, check hard exit time
+                        hold = time.time() - pos["entry_time"]
+                        if hold >= HARD_EXIT_SECONDS * 2:
+                            log.warning(f"NO DATA for {pos['symbol']} for 2x hard exit time — forcing close")
+                            await self.positions.close_position(trade_id, "NO_DATA_TIMEOUT", 0, emergency=True)
+                        continue
+
+                    pair = dex_data[addr]
+                    cp = float(pair.get("priceUsd", 0) or 0)
+                    cl = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+
+                    # v4.3: Track consecutive zero-price reads per position
+                    if cp <= 0:
+                        zero_count = pos.get("zero_price_count", 0) + 1
+                        with self.positions.lock:
+                            pos["zero_price_count"] = zero_count
+                        if zero_count >= 5:
+                            log.warning(f"ZERO PRICE x{zero_count} for {pos['symbol']} — forcing emergency exit")
+                            await self.positions.close_position(trade_id, f"ZERO_PRICE_{zero_count}x", 0, emergency=True)
+                        continue
+                    else:
+                        # Reset counter on good price
+                        with self.positions.lock:
+                            pos["zero_price_count"] = 0
+
+                    ep = pos["entry_price"]
+                    el = pos.get("entry_liq_usd", 0)
+                    peak = pos.get("peak_price", ep)
+
+                    if cp > peak:
+                        with self.positions.lock:
+                            pos["peak_price"] = cp
+                            peak = cp
+
+                    gain = ((cp / ep) - 1) * 100 if ep else 0
+                    drop = ((peak - cp) / peak) * 100 if peak > 0 else 0
+                    hold = time.time() - pos["entry_time"]
+
+                    # EXIT 1: LIQ DROP
+                    if el > 0:
+                        if cl == 0 and cp > 0:
+                            # v4.3: liq=0 but price exists = real pool drain
+                            log.warning(f"LIQ ZERO {pos['symbol']} (price=${cp:.8f} still exists)")
+                            await self.positions.close_position(trade_id, "EMERGENCY_LIQ_ZERO", cp, emergency=True)
+                            continue
+                        elif cl == 0 and cp == 0:
+                            # Both zero = likely DexScreener API failure, skip this cycle
+                            continue
+                        liq_drop = ((el - cl) / el) * 100
+                        if liq_drop >= LIQ_DROP_THRESHOLD_PCT:
+                            log.warning(f"LIQ DROP {pos['symbol']}: {liq_drop:.0f}% (${el:,.0f}->${cl:,.0f})")
+                            await self.positions.close_position(trade_id, f"EMERGENCY_LIQ_DROP_{liq_drop:.0f}pct", cp, emergency=True)
+                            continue
+
+                    # EXIT 2: LADDER SELLS (v4.3: always enabled)
+                    for thresh, frac in EXIT_LADDER:
+                        if gain >= thresh and thresh not in pos.get("ladder_levels_hit", set()):
+                            await self.positions.execute_ladder_sell(trade_id, thresh, frac, cp)
+
+                    # EXIT 3: TRAILING STOP
+                    if drop >= TRAILING_STOP_PCT and gain > 0:
+                        await self.positions.close_position(trade_id, f"TRAILING_STOP_{drop:.0f}pct", cp)
+                        continue
+
+                    # EXIT 4: STOP LOSS
+                    if gain <= -STOP_LOSS_PCT:
+                        await self.positions.close_position(trade_id, f"STOP_LOSS_{gain:.0f}pct", cp)
+                        continue
+
+                    # EXIT 5: HARD EXIT
+                    if hold >= HARD_EXIT_SECONDS:
+                        reentry = gain >= 50
+                        await self.positions.close_position(trade_id, f"HARD_EXIT_{hold:.0f}s", cp)
+                        # Re-entry enabled even in live test mode (counts toward trade limit)
+                        if reentry:
+                            tc = self.positions.get_token_trade_count(addr)
+                            if tc < MAX_TRADES_PER_TOKEN:
+                                log.info(f"RE-ENTRY candidate: {pos['symbol']} was +{gain:.0f}%")
+                                await asyncio.sleep(2)
+                                np, nl = await self.market.get_token_price_and_liq(addr)
+                                min_liq = MIN_LIQ_ENTRY  # V9.6: single gate for all
+                                if nl >= min_liq and np > 0:
+                                    # v4.4-prod Fix #7: Re-entry uses original grade without fresh
+                                    # enrichment. This is intentional because:
+                                    # - Kill signals (freeze_authority, creator history) are immutable
+                                    #   properties that don't change after first enrichment
+                                    # - Only liquidity changes, and we re-check it above
+                                    # TODO: In theory, a token could gain freeze authority after first
+                                    # trade via a new setAuthority TX. This is extremely rare on pump.fun
+                                    # tokens and would require a fresh Helius getAccountInfo call that
+                                    # adds ~200ms latency. Risk is minimal vs. speed cost.
+                                    await self.positions.open_position(
+                                        addr, pos["symbol"], pos["alert_grade"], nl, np,
+                                        pos.get("top1_pct", 0))
+                        continue
+
+                await asyncio.sleep(LIQ_CHECK_INTERVAL_MS / 1000)
+
+            except Exception as e:
+                log.error(f"Monitor error: {e}\n{traceback.format_exc()}")
+                await asyncio.sleep(1)
+
+    async def _health_loop(self):
+        initial_balance = None
+        while self.running:
             try:
-                reentry = " [RE]" if t["reentry_candidate"] else ""
-            except (KeyError, IndexError):
-                reentry = ""
-            rows += f"""<tr>
-                <td>{ts_str}</td><td>{t['symbol']}{tag}</td>
-                <td><span class="badge {grade_class}">{t['alert_grade']}</span></td>
-                <td>${t['entry_price']:.6f}</td><td>${t['exit_price']:.6f}</td>
-                <td class="{pclass}">{t['pnl_sol']:+.4f}</td>
-                <td class="{rpclass}">{rpnl:+.4f}</td>
-                <td>{hold:.0f}s</td><td>{t['exit_reason'][:30]}{reentry}</td>
-            </tr>"""
-        closed_table = f"""<table><tr><th>Time</th><th>Token</th><th>Grade</th><th>Entry</th>
-            <th>Exit</th><th>Shadow P&L</th><th>Reality P&L</th><th>Hold</th><th>Reason</th></tr>{rows}</table>"""
-    else:
-        closed_table = '<div class="empty">No closed trades yet</div>'
+                sol = await get_sol_balance(self.jupiter.wallet_pubkey)
+                oc = self.positions.open_count
+                
+                # Track initial balance for drop detection
+                # v4.3: Account for expected spend (open positions * pos size)
+                if initial_balance is None:
+                    initial_balance = sol
+                elif not SHADOW_MODE:
+                    expected_spend = safety_tracker.sol_spent_this_hour
+                    unexpected_drop = (initial_balance - sol) - expected_spend
+                    if unexpected_drop > 0.1:
+                        log.error(f"UNEXPECTED BALANCE DROP: {initial_balance:.4f} -> {sol:.4f} SOL (spent={expected_spend:.4f}, unexplained={unexpected_drop:.4f})")
+                        tg_send(f"BALANCE DROP ALERT: {initial_balance:.4f} -> {sol:.4f} SOL\nExpected spend: {expected_spend:.4f}\nUnexplained: {unexpected_drop:.4f}\nStopping trades!")
+                        safety_tracker.halted = True
+                        safety_tracker.halt_reason = f"Unexpected balance drop {unexpected_drop:.4f} SOL"
+                
+                conn = get_db()
+                try:
+                    row = conn.execute("SELECT SUM(pnl_sol), COUNT(*) FROM trades WHERE status='closed'").fetchone()
+                    pnl = row[0] or 0
+                    total = row[1] or 0
+                    wins = conn.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl_sol > 0").fetchone()[0]
+                finally:
+                    conn.close()
+                wr = (wins / total * 100) if total else 0
+                hc = helius_tracker.status()
 
-    if alerts:
-        rows = ""
-        for a in alerts:
-            grade_class = f"badge-{a['grade'].lower()}" if a['grade'] else "badge-c"
-            ts_str = datetime.fromtimestamp(a["ts"], tz=timezone.utc).strftime("%H:%M:%S") if a["ts"] else ""
-            rows += f"""<tr>
-                <td>{ts_str}</td><td>{a['symbol']}</td>
-                <td><span class="badge {grade_class}">{a['grade']}</span></td>
-                <td>${a['price_at_alert']:.6f}</td><td>{a['action']}</td>
-                <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">{a['entry_filters'][:60]}</td>
-            </tr>"""
-        alerts_table = f"""<table><tr><th>Time</th><th>Token</th><th>Grade</th>
-            <th>Price</th><th>Action</th><th>Filters</th></tr>{rows}</table>"""
-    else:
-        alerts_table = '<div class="empty">No alerts yet</div>'
+                # v4.4-prod Fix #10: Compare theoretical PnL to actual wallet balance change.
+                # Since we can't parse exact SOL received from TX results, we compare
+                # theoretical (DB-tracked) PnL to actual wallet balance delta.
+                # Log any divergence > 5% as it indicates slippage/fee accumulation.
+                if initial_balance is not None and total > 0 and not SHADOW_MODE:
+                    expected_spend_open = self.positions.open_count * POSITION_SIZE_SOL
+                    actual_wallet_pnl = sol - initial_balance + expected_spend_open
+                    theoretical_pnl = pnl
+                    if abs(theoretical_pnl) > 0.001:
+                        divergence_pct = abs(actual_wallet_pnl - theoretical_pnl) / abs(theoretical_pnl) * 100
+                        if divergence_pct > 5:
+                            log.warning(
+                                f"PNL DIVERGENCE: wallet={actual_wallet_pnl:+.4f} vs theoretical={theoretical_pnl:+.4f} "
+                                f"({divergence_pct:.1f}% off) — likely slippage/fee accumulation"
+                            )
 
-    if missed:
-        rows = ""
-        for m in missed:
-            ts_str = datetime.fromtimestamp(m["ts"], tz=timezone.utc).strftime("%H:%M:%S") if m["ts"] else ""
-            peak_class = "pnl-pos" if m["peak_gain_pct"] > 0 else ""
-            rows += f"""<tr>
-                <td>{ts_str}</td><td>{m['symbol']}</td><td>{m['alert_grade']}</td>
-                <td>{m['reason']}</td>
-                <td class="{peak_class}">{m['peak_gain_pct']:+.1f}%</td>
-                <td>{m['final_gain_pct']:+.1f}%</td>
-            </tr>"""
-        missed_table = f"""<table><tr><th>Time</th><th>Token</th><th>Grade</th>
-            <th>Reason</th><th>Peak</th><th>Final</th></tr>{rows}</table>"""
-    else:
-        missed_table = '<div class="empty">No missed opportunities</div>'
+                log.info(f"HEALTH | SOL: {sol:.4f} | Open: {oc} | Closed: {total} | WR: {wr:.0f}% | PnL: {pnl:+.4f} | Helius: {hc['today']}/day | Trades: {safety_tracker.trades_today}/{MAX_DAILY_TRADES} | Halted: {safety_tracker.halted}")
 
-    time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                if sol < POSITION_SIZE_SOL and sol > 0 and not SHADOW_MODE:
+                    tg_send(f"LOW BALANCE: {sol:.4f} SOL")
+            except Exception as e:
+                log.error(f"Health error: {e}")
+            await asyncio.sleep(300)
 
-    html = DASHBOARD_HTML
-    for k, v in [("time_utc", time_utc), ("sol_price", f"{sol_price:.2f}"), ("fng", str(fng)),
-                 ("fng_color", fng_color), ("tracking", str(tracking)), ("open_pos", str(open_pos)),
-                 ("total_trades", str(total_trades)), ("win_rate", win_rate), ("wr_color", wr_color),
-                 ("total_pnl", f"{total_pnl:+.4f}"), ("pnl_color", pnl_color),
-                 ("reality_pnl", f"{reality_total:+.4f}"), ("rpnl_color", rpnl_color),
-                 ("alerts_today", str(alerts_today_count)), ("uptime", uptime),
-                 ("circuit_breaker_html", circuit_breaker_html),
-                 ("open_table", open_table), ("closed_table", closed_table),
-                 ("alerts_table", alerts_table), ("missed_table", missed_table)]:
-        html = html.replace("{{" + k + "}}", v)
-    return html
+    async def cleanup_sessions(self):
+        """v4.4-prod Fix #9: Close persistent aiohttp sessions on shutdown."""
+        global _tg_session
+        await close_rpc_session()
+        if _tg_session and not _tg_session.closed:
+            await _tg_session.close()
+            _tg_session = None
 
+    def stop(self):
+        self.running = False
+        tg_send(f"Wave Rider {VERSION} stopped")
 
-# --- Routes ------------------------------------------------------------------
+# ============================================================
+# WEB SERVER + DASHBOARD
+# ============================================================
 
-@app.route("/")
-def dashboard():
-    return render_dashboard(), 200, {"Content-Type": "text/html"}
+def run_health_server():
+    from flask import Flask, jsonify, Response
+    app = Flask(__name__)
 
-
-@app.route("/health")
-def health():
-    with state_lock:
+    @app.route("/health")
+    def health():
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT SUM(pnl_sol), COUNT(*) FROM trades WHERE status='closed'").fetchone()
+            oc = conn.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
+        finally:
+            conn.close()
         return jsonify({
-            "status": "ok", "version": VERSION,
-            "started": state["started"], "sol_price": state["sol_price"],
-            "fng": state["fng"], "tracking": len(state["tokens"]),
-            "open_positions": len(state["open_positions"]),
-            "tick_count": state["tick_count"],
-            "uptime_seconds": time.time() - state["start_time"] if state["start_time"] else 0,
-            "circuit_breaker": state["circuit_breaker_active"],
-            "daily_pnl": state["daily_pnl"],
-            "consecutive_losses": state["consecutive_losses"],
+            "status": "running", "version": VERSION, "shadow": SHADOW_MODE,
+            "live_test_mode": LIVE_TEST_MODE,
+            "open_positions": oc, "closed_trades": row[1] or 0,
+            "total_pnl_sol": round(row[0] or 0, 4),
+            "helius_credits": helius_tracker.status(),
+            "safety": safety_tracker.status(),
         })
 
+    @app.route("/stop")
+    def stop():
+        return jsonify({"status": "stopping"})
 
-@app.route("/api/shadow")
-def api_shadow():
-    with get_db() as db:
-        open_trades = [dict(r) for r in db.execute(
-            "SELECT * FROM shadow_trades WHERE status='open' ORDER BY entry_time DESC").fetchall()]
-        closed_trades = [dict(r) for r in db.execute(
-            "SELECT * FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 50").fetchall()]
-        total_pnl = db.execute("SELECT COALESCE(SUM(pnl_sol),0) as s FROM shadow_trades WHERE status='closed'").fetchone()["s"]
-        reality_pnl = db.execute("SELECT COALESCE(SUM(realistic_pnl_sol),0) as s FROM shadow_trades WHERE status='closed'").fetchone()["s"]
-        total_closed = db.execute("SELECT COUNT(*) as c FROM shadow_trades WHERE status='closed'").fetchone()["c"]
-        wins = db.execute("SELECT COUNT(*) as c FROM shadow_trades WHERE status='closed' AND pnl_sol>0").fetchone()["c"]
-    return jsonify({
-        "open": open_trades, "closed": closed_trades,
-        "stats": {"total_pnl_sol": total_pnl, "reality_pnl_sol": reality_pnl,
-                  "total_trades": total_closed,
-                  "wins": wins, "win_rate": (wins / total_closed * 100) if total_closed else 0}
-    })
+    @app.route("/dashboard")
+    def dashboard():
+        return Response(DASHBOARD_HTML, mimetype="text/html")
 
+    @app.route("/api/data")
+    def api_data():
+        conn = get_db()
+        try:
+            conn.row_factory = sqlite3.Row
+            op = conn.execute("SELECT * FROM trades WHERE status='open' ORDER BY entry_time DESC").fetchall()
+            cl = conn.execute("SELECT * FROM trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 50").fetchall()
+            stats = conn.execute("""SELECT COUNT(*) as total,
+                SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as wins,
+                COALESCE(SUM(pnl_sol),0) as total_pnl,
+                COALESCE(MAX(pnl_sol),0) as best, COALESCE(MIN(pnl_sol),0) as worst
+                FROM trades WHERE status='closed'""").fetchone()
+            cb = conn.execute("SELECT * FROM circuit_breaker WHERE id=1").fetchone()
+            # Recent rejections
+            rej = conn.execute("SELECT symbol, rejection_reason, detected_at FROM token_history WHERE rejection_reason IS NOT NULL ORDER BY detected_at DESC LIMIT 10").fetchall()
+        finally:
+            conn.close()
+        def r2d(r):
+            return {k: r[k] for k in r.keys()} if r else {}
+        return jsonify({
+            "open": [r2d(r) for r in op], "closed": [r2d(r) for r in cl],
+            "stats": r2d(stats), "rejections": [r2d(r) for r in rej],
+            "circuit_breaker": {"daily_pnl": cb["daily_pnl"] if cb else 0,
+                "hourly_pnl": cb["hourly_pnl"] if cb else 0,
+                "consecutive_losses": cb["consecutive_losses"] if cb else 0,
+                "paused": bool(cb["paused"]) if cb else False} if cb else {},
+            "version": VERSION, "shadow": SHADOW_MODE,
+            "position_size": POSITION_SIZE_SOL,
+            "helius": helius_tracker.status(),
+            "safety": safety_tracker.status(),
+            "live_test_mode": LIVE_TEST_MODE,
+        })
 
-@app.route("/api/alerts")
-def api_alerts():
-    with get_db() as db:
-        rows = [dict(r) for r in db.execute("SELECT * FROM alerts ORDER BY ts DESC LIMIT 50").fetchall()]
-    return jsonify(rows)
-
-
-@app.route("/api/waves")
-def api_waves():
-    limit = request.args.get("limit", 50, type=int)
-    with get_db() as db:
-        rows = [dict(r) for r in db.execute(
-            "SELECT * FROM tokens ORDER BY detected_at DESC LIMIT ?", (limit,)).fetchall()]
-    return jsonify(rows)
-
-
-@app.route("/api/hindsight")
-def api_hindsight():
-    with get_db() as db:
-        trades_data = [dict(r) for r in db.execute("""
-            SELECT symbol, alert_grade, trade_number, entry_price, exit_price, exit_reason,
-                   pnl_pct, peak_price_during, shadow_pnl_sol, realistic_pnl_sol,
-                   price_2min_after_exit, price_5min_after_exit, price_10min_after_exit,
-                   hindsight_checked, reentry_candidate
-            FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 50
-        """).fetchall()]
-
-    results = []
-    good_exits = 0
-    left_money = 0
-    for t in trades_data:
-        entry = t["entry_price"] or 0
-        r = dict(t)
-        if entry and t["price_10min_after_exit"]:
-            r["pnl_if_held_10min"] = ((t["price_10min_after_exit"] / entry) - 1) * 100
-            r["verdict"] = "GOOD_EXIT" if t["pnl_pct"] >= r["pnl_if_held_10min"] else "LEFT_MONEY"
-            if r["verdict"] == "GOOD_EXIT": good_exits += 1
-            else: left_money += 1
-        else:
-            r["pnl_if_held_10min"] = None
-            r["verdict"] = "pending"
-        results.append(r)
-
-    return jsonify({
-        "trades": results,
-        "summary": {"good_exits": good_exits, "left_money": left_money,
-                     "exit_accuracy": f"{good_exits*100/max(good_exits+left_money,1):.0f}%"}
-    })
+    # v4.4-prod Fix #13: Flask dev server is fine for current load (single-user dashboard).
+    # If load increases, switch to gunicorn/uvicorn. Not worth the complexity now.
+    import threading
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080, debug=False), daemon=True).start()
 
 
-@app.route("/api/export")
-def api_export():
-    with get_db() as db:
-        tokens = [dict(r) for r in db.execute("SELECT * FROM tokens ORDER BY detected_at DESC LIMIT 500").fetchall()]
-        shadows = [dict(r) for r in db.execute("SELECT * FROM shadow_trades ORDER BY entry_time DESC").fetchall()]
-        alerts_data = [dict(r) for r in db.execute("SELECT * FROM alerts ORDER BY ts DESC LIMIT 200").fetchall()]
-        missed_data = [dict(r) for r in db.execute("SELECT * FROM missed_opportunities ORDER BY ts DESC").fetchall()]
-    return jsonify({
-        "version": VERSION, "exported_at": time.time(),
-        "tokens": tokens, "shadow_trades": shadows,
-        "alerts": alerts_data, "missed_opportunities": missed_data,
-    })
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Wave Rider v4.0</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;padding:15px}
+h1{color:#00ff88;font-size:1.4em;margin-bottom:10px}
+h2{color:#00aaff;font-size:1.1em;margin:15px 0 8px;border-bottom:1px solid #333;padding-bottom:4px}
+.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin:10px 0}
+.c{background:#151520;border:1px solid #333;border-radius:8px;padding:10px;text-align:center}
+.v{font-size:1.3em;font-weight:bold;margin:3px 0}
+.l{font-size:.7em;color:#888;text-transform:uppercase}
+.gr{color:#00ff88}.rd{color:#ff4444}.yl{color:#ffaa00}.bl{color:#00aaff}
+table{width:100%;border-collapse:collapse;font-size:.78em;margin:5px 0}
+th{background:#1a1a2e;color:#00aaff;padding:5px 3px;text-align:left}
+td{padding:4px 3px;border-bottom:1px solid #1a1a2e}
+tr:hover{background:#1a1a2e}
+.bd{padding:2px 5px;border-radius:4px;font-size:.72em;font-weight:bold}
+.ba{background:#00ff8833;color:#00ff88}.bb{background:#00aaff33;color:#00aaff}
+.pa{background:#ff444433;border:2px solid #ff4444;padding:8px;border-radius:8px;text-align:center;margin:8px 0}
+.sh{background:#ffaa0033;border:1px solid #ffaa00;padding:5px;border-radius:5px;text-align:center;margin:5px 0;font-size:.8em}
+.nd{color:#555;text-align:center;padding:15px}
+#u{color:#888;font-size:.75em}
+</style></head><body>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+<h1>Wave Rider v4.0</h1><span id="u">Loading...</span></div>
+<div id="sh"></div><div id="pa"></div>
+<div class="g" id="sg"></div>
+<h2>Open Positions</h2><div id="ot"></div>
+<h2>Recent Trades</h2><div id="ct"></div>
+<h2>Recent Rejections</h2><div id="rj"></div>
+<script>
+function f(n,d=4){return n!=null?Number(n).toFixed(d):'-'}
+function pc(v){return v>0?'gr':v<0?'rd':''}
+function bd(g){return'<span class="bd b'+(g||'').toLowerCase()+'">'+(g||'?')+'</span>'}
+async function R(){try{let r=await fetch('/api/data'),d=await r.json(),s=d.stats||{},cb=d.circuit_breaker||{};
+let t=s.total||0,w=s.wins||0,wr=t>0?(w/t*100).toFixed(0)+'%':'-',p=s.total_pnl||0;
+if(d.shadow)document.getElementById('sh').innerHTML='<div class="sh">SHADOW MODE - No real trades</div>';
+else document.getElementById('sh').innerHTML='';
+if(cb.paused)document.getElementById('pa').innerHTML='<div class="pa">CIRCUIT BREAKER ACTIVE</div>';
+else document.getElementById('pa').innerHTML='';
+let h=d.helius||{};
+document.getElementById('sg').innerHTML=
+'<div class="c"><div class="l">PnL</div><div class="v '+pc(p)+'">'+(p>=0?'+':'')+f(p)+' SOL</div></div>'+
+'<div class="c"><div class="l">Win Rate</div><div class="v '+(w/t>=.5?'gr':'yl')+'">'+wr+'</div></div>'+
+'<div class="c"><div class="l">Open</div><div class="v bl">'+(d.open||[]).length+'</div></div>'+
+'<div class="c"><div class="l">Closed</div><div class="v">'+t+'</div></div>'+
+'<div class="c"><div class="l">Best</div><div class="v gr">+'+f(s.best)+' SOL</div></div>'+
+'<div class="c"><div class="l">Worst</div><div class="v rd">'+f(s.worst)+' SOL</div></div>'+
+'<div class="c"><div class="l">Daily</div><div class="v '+pc(cb.daily_pnl)+'">'+(cb.daily_pnl>=0?'+':'')+f(cb.daily_pnl||0)+'</div></div>'+
+'<div class="c"><div class="l">Helius/day</div><div class="v">'+(h.today||0)+'</div></div>';
+let op=d.open||[];
+if(op.length>0){let h='<table><tr><th>Token</th><th>Gr</th><th>#</th><th>Entry</th><th>Hold</th><th>Rem</th></tr>';
+op.forEach(t=>{let hold=Date.now()/1000-t.entry_time,m=Math.floor(hold/60);
+h+='<tr><td>'+t.symbol+'</td><td>'+bd(t.alert_grade)+'</td><td>'+
+(t.trade_number||1)+'</td><td>$'+f(t.entry_price,8)+'</td><td>'+m+'m</td><td>'+
+((t.remaining_pct||1)*100).toFixed(0)+'%</td></tr>'});
+document.getElementById('ot').innerHTML=h+'</table>'}
+else document.getElementById('ot').innerHTML='<div class="nd">Scanning...</div>';
+let cl=d.closed||[];
+if(cl.length>0){let h='<table><tr><th>Token</th><th>Gr</th><th>PnL</th><th>%</th><th>Exit</th><th>Hold</th></tr>';
+cl.forEach(t=>{let p=t.pnl_sol||0,hold=t.exit_time&&t.entry_time?Math.floor((t.exit_time-t.entry_time)/60)+'m':'-';
+h+='<tr><td>'+t.symbol+'</td><td>'+bd(t.alert_grade)+'</td><td class="'+pc(p)+'">'+(p>=0?'+':'')+f(p)+
+'</td><td class="'+pc(t.pnl_pct)+'">'+(t.pnl_pct>=0?'+':'')+f(t.pnl_pct,1)+'%</td><td>'+
+(t.exit_reason||'-').replace(/_/g,' ')+'</td><td>'+hold+'</td></tr>'});
+document.getElementById('ct').innerHTML=h+'</table>'}
+else document.getElementById('ct').innerHTML='<div class="nd">Waiting...</div>';
+let rj=d.rejections||[];
+if(rj.length>0){let h='<table><tr><th>Token</th><th>Reason</th><th>Time</th></tr>';
+rj.forEach(r=>{let t=new Date(r.detected_at*1000).toLocaleTimeString();
+h+='<tr><td>'+r.symbol+'</td><td>'+r.rejection_reason+'</td><td>'+t+'</td></tr>'});
+document.getElementById('rj').innerHTML=h+'</table>'}
+else document.getElementById('rj').innerHTML='<div class="nd">No rejections yet</div>';
+document.getElementById('u').textContent=new Date().toLocaleTimeString()+' | '+d.version+(d.shadow?' [SHADOW]':' [LIVE]');
+}catch(e){document.getElementById('u').textContent='Error: '+e.message}}
+R();setInterval(R,5000);
+</script></body></html>"""
 
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
-@app.route("/logs")
-def logs():
-    lines = list(log_buffer)
-    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-    <title>WR9.6 Logs</title><meta http-equiv="refresh" content="5">
-    <style>body{{background:#0d1117;color:#c9d1d9;font-family:monospace;font-size:12px;padding:16px}}
-    pre{{white-space:pre-wrap}}</style></head>
-    <body><h2 style="color:#58a6ff">Wave Rider V9.6 Logs ({len(lines)} lines)</h2>
-    <pre>{"<br>".join(lines[-LOG_MAX_LINES:])}</pre></body></html>"""
-    return html, 200, {"Content-Type": "text/html"}
-
-
-# --- Entry point -------------------------------------------------------------
+async def main():
+    bot = WaveRiderBot()
+    init_db()  # v4.4: Create DB before Flask starts
+    run_health_server()
+    try:
+        await bot.start()
+    except KeyboardInterrupt:
+        bot.stop()
+        await bot.cleanup_sessions()
+    except Exception as e:
+        log.error(f"Fatal: {e}\n{traceback.format_exc()}")
+        tg_send(f"BOT CRASHED: {e}")
+        bot.stop()
+        await bot.cleanup_sessions()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    asyncio.run(main())
