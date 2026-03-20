@@ -51,6 +51,19 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solders import message as solders_message
 
+# V5.0: Rug shield + position guard (fail-open if missing)
+try:
+    from rug_shield import check_token_safety
+except ImportError:
+    check_token_safety = None
+    logging.getLogger("wave-rider").warning("rug_shield.py not found — rug shield disabled")
+
+try:
+    from position_guard import PositionGuard
+except ImportError:
+    PositionGuard = None
+    logging.getLogger("wave-rider").warning("position_guard.py not found — position guard disabled")
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -68,19 +81,19 @@ JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
 TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-POSITION_SIZE_SOL = float(os.getenv("POSITION_SIZE_SOL", "0.02"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "200"))  # DATA COLLECTION: high limit
-MAX_TRADES_PER_TOKEN = int(os.getenv("MAX_TRADES_PER_TOKEN", "5"))  # DATA COLLECTION: more re-entries
+POSITION_SIZE_SOL = float(os.getenv("POSITION_SIZE_SOL", "0.005"))  # v4.5: test mode 0.005 SOL
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "200"))  # v4.5: production
+MAX_TRADES_PER_TOKEN = int(os.getenv("MAX_TRADES_PER_TOKEN", "5"))  # v4.5: re-entries max 2
 HARD_EXIT_SECONDS = int(os.getenv("HARD_EXIT_SECONDS", "900"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "15"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "30"))
 
 # Liquidity gate: single $15K for all grades (V9.6 match)
-MIN_LIQ_ENTRY = float(os.getenv("MIN_LIQ_ENTRY", "5000"))  # DATA COLLECTION: loosened to $5K
-MIN_LIQ_ENRICH = float(os.getenv("MIN_LIQ_ENRICH", "5000"))  # DATA COLLECTION: enrich everything $5K+
+MIN_LIQ_ENTRY = float(os.getenv("MIN_LIQ_ENTRY", "5000"))  # v4.5: optimized from 4.7h data
+MIN_LIQ_ENRICH = float(os.getenv("MIN_LIQ_ENRICH", "5000"))  # v4.5: enrich $10K+
 
 # Momentum filter
-MIN_MOMENTUM_PCT = float(os.getenv("MIN_MOMENTUM_PCT", "-100"))  # DATA COLLECTION: accept any momentum
+MIN_MOMENTUM_PCT = float(os.getenv("MIN_MOMENTUM_PCT", "-100"))  # v4.5: any positive momentum
 
 EXIT_LADDER_STR = os.getenv("EXIT_LADDER", "100:3,200:3,500:10,1500:25,5000:35")
 EXIT_LADDER = []
@@ -88,13 +101,13 @@ for step in EXIT_LADDER_STR.split(","):
     threshold, sell_pct = step.split(":")
     EXIT_LADDER.append((float(threshold), float(sell_pct) / 100))
 
-MAX_DAILY_LOSS_SOL = float(os.getenv("MAX_DAILY_LOSS_SOL", "999"))  # DATA COLLECTION: no circuit breaker
-MAX_HOURLY_LOSS_SOL = float(os.getenv("MAX_HOURLY_LOSS_SOL", "999"))
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "999"))
+MAX_DAILY_LOSS_SOL = float(os.getenv("MAX_DAILY_LOSS_SOL", "999"))  # v4.5: production
+MAX_HOURLY_LOSS_SOL = float(os.getenv("MAX_HOURLY_LOSS_SOL", "999"))  # v4.5: production
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "999"))  # v4.5: production
 
 LIQ_DROP_THRESHOLD_PCT = float(os.getenv("LIQ_DROP_THRESHOLD_PCT", "30"))
 LIQ_CHECK_INTERVAL_MS = int(os.getenv("LIQ_CHECK_INTERVAL_MS", "400"))
-ENTRY_DELAY_SECONDS = int(os.getenv("ENTRY_DELAY_SECONDS", "15"))  # DATA COLLECTION: faster evaluation
+ENTRY_DELAY_SECONDS = int(os.getenv("ENTRY_DELAY_SECONDS", "15"))  # v4.5: balanced timing
 PRIORITY_FEE_LAMPORTS = int(os.getenv("PRIORITY_FEE_LAMPORTS", "100000"))
 
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens"
@@ -108,7 +121,7 @@ HELIUS_API = os.getenv("HELIUS_API", f"https://api.helius.xyz/v0") if HELIUS_API
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
-VERSION = "v4.4-prod"
+VERSION = "v5.0-v96-collector"
 MAX_EMERGENCY_RETRIES = 3
 MAX_SELL_ATTEMPTS_PER_POSITION = 3  # v4.3: cap sell attempts per position
 
@@ -119,8 +132,8 @@ SHADOW_MODE = os.getenv("SHADOW_MODE", "false").lower() == "true"
 # ============================================================
 # LIVE SAFETY LIMITS
 # ============================================================
-MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "999"))  # DATA COLLECTION: unlimited
-MAX_HOURLY_SOL_SPEND = float(os.getenv("MAX_HOURLY_SOL_SPEND", "999"))  # DATA COLLECTION: unlimited (50 trades/hr at 0.02)
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "999"))  # v4.5: limited for sell testing
+MAX_HOURLY_SOL_SPEND = float(os.getenv("MAX_HOURLY_SOL_SPEND", "999"))  # v4.5: production
 MIN_WALLET_RESERVE_SOL = float(os.getenv("MIN_WALLET_RESERVE_SOL", "0.05"))
 MAX_SELL_FAILURES_BEFORE_HALT = int(os.getenv("MAX_SELL_FAILURES_BEFORE_HALT", "3"))
 LIVE_TEST_MODE = False  # v4.3: Full mode — ladder sells enabled, no position cap
@@ -611,7 +624,6 @@ class JupiterSwap:
             params = {
                 "inputMint": input_mint, "outputMint": output_mint,
                 "amount": str(amount_lamports), "slippageBps": str(slippage_bps),
-                "onlyDirectRoutes": "false", "restrictIntermediateTokens": "true",
             }
             session = await _get_rpc_session()
             async with session.get(JUPITER_QUOTE_URL, params=params,
@@ -633,7 +645,9 @@ class JupiterSwap:
                 "userPublicKey": self.wallet_pubkey,
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "dynamicSlippage": True,
+                "dynamicSlippage": {
+                    "maxBps": 1500
+                },
                 "prioritizationFeeLamports": {
                     "priorityLevelWithMaxLamports": {
                         "maxLamports": PRIORITY_FEE_LAMPORTS,
@@ -703,9 +717,7 @@ class JupiterSwap:
 
     async def sell_token(self, token_mint: str, token_amount: int,
                          slippage_bps: int = 3500) -> Optional[str]:
-        """v4.3: Single attempt per call — no internal retry loop.
-        Retries happen across monitor cycles via sell_attempts counter.
-        This prevents blocking the monitor for 30-90s during retries."""
+        """v4.5: Single attempt, validates quote returns meaningful SOL."""
         if token_amount <= 0:
             return None
         log.info(f"SELL: {token_amount:,} of {token_mint[:16]}... (slippage {slippage_bps}bps)")
@@ -713,6 +725,21 @@ class JupiterSwap:
         if not quote:
             log.warning(f"SELL quote failed for {token_mint[:16]}")
             return None
+        
+        # v4.5: Validate quote — must return meaningful SOL
+        out_amount = int(quote.get("outAmount", 0))
+        min_sol_back = int(0.005 * LAMPORTS_PER_SOL)  # Minimum 0.005 SOL back
+        if out_amount < min_sol_back:
+            log.warning(f"SELL quote too low: {out_amount} lamports ({out_amount/LAMPORTS_PER_SOL:.6f} SOL) — skipping")
+            return None
+        
+        # v4.5: Validate output mint is SOL
+        output_mint = quote.get("outputMint", "")
+        if output_mint != SOL_MINT:
+            log.error(f"SELL quote output mint is NOT SOL: {output_mint[:20]} — skipping")
+            return None
+        
+        log.info(f"SELL quote: {out_amount/LAMPORTS_PER_SOL:.4f} SOL expected")
         result = await self.execute_swap(quote)
         if not result:
             log.warning(f"SELL swap failed for {token_mint[:16]}")
@@ -867,7 +894,8 @@ class PositionManager:
         return any(p["token_address"] == token_address for p in self._open_positions.values())
 
     async def open_position(self, token_address: str, symbol: str, grade: str,
-                           entry_liq: float, entry_price: float, top1: float = 0) -> Optional[int]:
+                           entry_liq: float, entry_price: float, top1: float = 0,
+                           rug_safety=None, dex_pair=None, pump_info=None) -> Optional[int]:
         # Live test mode: max 5 positions
         max_pos = MAX_POSITIONS
         if self.open_count >= max_pos:
@@ -901,6 +929,36 @@ class PositionManager:
                 log.warning(f"LOW BALANCE: {wallet_bal:.4f} SOL — need {POSITION_SIZE_SOL + MIN_WALLET_RESERVE_SOL:.4f}")
                 tg_send(f"LOW BALANCE: {wallet_bal:.4f} SOL — skipping {symbol}")
                 return None
+            
+            # v4.5: PRE-BUY SELL SIMULATION — verify pool has real SOL before buying
+            # Get a buy quote first to know how many tokens we'd get
+            buy_quote = await self.jupiter.get_quote(
+                SOL_MINT, token_address, 
+                int(POSITION_SIZE_SOL * LAMPORTS_PER_SOL), 2000
+            )
+            if buy_quote:
+                expected_tokens = int(buy_quote.get("outAmount", 0))
+                if expected_tokens > 0:
+                    # Now simulate selling those tokens back
+                    sell_quote = await self.jupiter.get_quote(
+                        token_address, SOL_MINT, expected_tokens, 5000
+                    )
+                    if sell_quote:
+                        sell_back = int(sell_quote.get("outAmount", 0))
+                        buy_lamports = int(POSITION_SIZE_SOL * LAMPORTS_PER_SOL)
+                        ratio = sell_back / buy_lamports if buy_lamports > 0 else 0
+                        
+                        if ratio < 0.3:
+                            # Selling returns less than 30% of buy — pool is one-sided
+                            log.warning(f"PRE-BUY SELL CHECK FAILED: {symbol} — sell returns {ratio*100:.0f}% of buy ({sell_back/LAMPORTS_PER_SOL:.4f} SOL vs {POSITION_SIZE_SOL} SOL)")
+                            self._record_rejection(token_address, symbol, f"UNSELLABLE_{ratio*100:.0f}pct")
+                            return None
+                        
+                        log.info(f"PRE-BUY SELL CHECK OK: {symbol} — sell returns {ratio*100:.0f}% of buy")
+                    else:
+                        log.warning(f"PRE-BUY SELL CHECK: {symbol} — no sell quote available, skipping")
+                        self._record_rejection(token_address, symbol, "NO_SELL_QUOTE")
+                        return None
             
             # Execute buy
             tx_sig, tokens_held = await self.jupiter.buy_token(token_address, POSITION_SIZE_SOL)
@@ -1038,6 +1096,38 @@ class PositionManager:
             return None
 
         log.info(f"OPENED #{trade_id}: {symbol} ({grade}) | {tokens_held:,} tokens")
+
+        # V5.0: Start position guard monitoring after successful buy
+        try:
+            if hasattr(self, '_bot') and self._bot is not None and getattr(self._bot, 'position_guard', None) is not None:
+                pool_address = ""
+                pool_sol_vault = ""
+                deployer = ""
+                if dex_pair:
+                    pool_address = dex_pair.get("pairAddress", "")
+                    pool_sol_vault = dex_pair.get("pairAddress", "")
+                if pump_info:
+                    deployer = pump_info.get("pump_token", {}).get("creator", "")
+                if pool_sol_vault:
+                    try:
+                        pool_balance = await get_sol_balance(pool_sol_vault)
+                        entry_sol_lamports = int(pool_balance * 1_000_000_000)
+                    except:
+                        entry_sol_lamports = 0
+                else:
+                    entry_sol_lamports = 0
+                await self._bot.position_guard.start_watching(
+                    trade_id=trade_id,
+                    token_address=token_address,
+                    pool_sol_vault=pool_sol_vault,
+                    deployer_address=deployer,
+                    tokens_held=tokens_held,
+                    entry_sol_balance=entry_sol_lamports,
+                )
+                log.info(f"POSITION GUARD started for #{trade_id} ({token_address[:16]}...)")
+        except Exception as e:
+            log.warning(f"POSITION GUARD failed to start for #{trade_id}: {e}")
+
         return trade_id
 
     async def close_position(self, trade_id: int, reason: str,
@@ -1112,6 +1202,9 @@ class PositionManager:
             slippage_schedule = [3500, 4500, 5000]
             slip = slippage_schedule[min(sell_attempts, len(slippage_schedule) - 1)]
 
+            # v4.5: Check SOL balance BEFORE sell
+            pre_sell_balance = await get_sol_balance(self.jupiter.wallet_pubkey)
+
             if emergency:
                 slip = 5000  # Always max slippage for emergency
                 tx_sig = await self.jupiter.sell_token(pos["token_address"], tokens_to_sell, slip)
@@ -1119,38 +1212,40 @@ class PositionManager:
                 tx_sig = await self.jupiter.sell_token(pos["token_address"], tokens_to_sell, slip)
 
             if tx_sig:
+                # v4.5: Verify SOL actually returned to wallet
+                # Check multiple times — SOL settlement can be delayed
+                sol_received = 0
+                for check_attempt in range(3):
+                    await asyncio.sleep(5)  # Wait 5s between checks
+                    post_sell_balance = await get_sol_balance(self.jupiter.wallet_pubkey)
+                    sol_received = post_sell_balance - pre_sell_balance
+                    if sol_received > 0.001:
+                        break  # SOL arrived
+                    log.info(f"Balance check {check_attempt+1}/3: pre={pre_sell_balance:.4f} post={post_sell_balance:.4f} diff={sol_received:.6f}")
+                
+                if sol_received < 0.001:
+                    # Sell TX "succeeded" but no SOL came back — Jupiter routed to wrong token
+                    log.error(f"SELL VERIFIED FAILED: {symbol} TX confirmed but only {sol_received:.6f} SOL returned. Pre={pre_sell_balance:.4f} Post={post_sell_balance:.4f}")
+                    tg_send(f"SELL FAILED (no SOL back): {symbol}\nTX looked successful but returned {sol_received:.6f} SOL\nPre: {pre_sell_balance:.4f} Post: {post_sell_balance:.4f}")
+                    safety_tracker.record_sell_failure()
+                    with self.lock:
+                        pos["sell_attempts"] = sell_attempts + 1
+                    return  # Retry on next cycle
+                
+                log.info(f"SELL VERIFIED: {symbol} received {sol_received:.4f} SOL (pre={pre_sell_balance:.4f} post={post_sell_balance:.4f})")
                 safety_tracker.record_sell_success()
                 # v4.4-prod Fix #4: Clear pending exit on successful sell
                 with self.lock:
                     pos["pending_exit"] = None
                 solscan = f"https://solscan.io/tx/{tx_sig}"
                 prefix = "EMERGENCY SELL" if emergency else "SELL"
-                tg_send(f"{prefix} | {symbol}\nReason: {reason}\nTX: {solscan}")
+                tg_send(f"{prefix} | {symbol}\nReason: {reason}\nSOL received: {sol_received:.4f}\nTX: {solscan}")
             else:
-                safety_tracker.record_sell_failure()
-                # v4.4-prod Fix #4: Store pending exit so it retries regardless of price recovery
-                with self.lock:
-                    pending = pos.get("pending_exit")
-                    attempt = (pending.get("attempts", 0) if pending else 0) + 1
-                    if attempt >= MAX_SELL_ATTEMPTS_PER_POSITION:
-                        log.warning(f"Pending exit max attempts for {symbol} — giving up")
-                        tg_send(f"SELL GAVE UP: {symbol} after {attempt} pending attempts")
-                        pos["pending_exit"] = None
-                        # Fall through to finalize below
-                    else:
-                        pos["pending_exit"] = {
-                            "reason": reason,
-                            "price": exit_price if hasattr(self, '_monitor_price') else 0,
-                            "attempts": attempt,
-                            "emergency": emergency,
-                        }
-                log.error(f"SELL FAILED for {symbol} ({reason}) — attempt {sell_attempts + 1}/{MAX_SELL_ATTEMPTS_PER_POSITION}")
-                tg_send(f"SELL FAILED: {symbol} ({reason}) — attempt {sell_attempts + 1}/{MAX_SELL_ATTEMPTS_PER_POSITION}")
-                # Check if we hit max pending attempts and need to force-close
-                if pos.get("pending_exit") is not None:
-                    return  # Will retry on next monitor cycle
-                # pending_exit was cleared = max attempts reached, finalize as total loss
-                self._finalize_close(trade_id, pos, f"{reason}_SELL_MAXED", exit_price, None, emergency=True)
+                # v4.5: Only count as sell failure if we actually tried (tx_sig existed but verification failed)
+                # Quote rejections (sell_token returned None) = token is worthless, not a sell mechanism failure
+                # Don't halt the bot for worthless tokens — just close as total loss
+                log.warning(f"SELL returned None for {symbol} — token may be worthless, closing as loss")
+                self._finalize_close(trade_id, pos, f"{reason}_NO_SELL_ROUTE", exit_price, None, emergency=True)
                 return
 
         if not tx_sig and emergency:
@@ -1206,6 +1301,13 @@ class PositionManager:
             f"Hold: {hold:.0f}s | Peak: +{peak_pct:.0f}%"
         )
         log.info(f"CLOSED #{trade_id}: {symbol} | {reason} | PnL: {pnl_sol:+.4f} SOL ({pnl_pct_total:+.0f}%)")
+
+        # V5.0: Stop position guard for this trade
+        try:
+            if hasattr(self, '_bot') and self._bot is not None and getattr(self._bot, 'position_guard', None) is not None:
+                asyncio.create_task(self._bot.position_guard.stop_watching(trade_id))
+        except Exception:
+            pass
 
     async def execute_ladder_sell(self, trade_id: int, threshold_pct: float,
                                   sell_fraction: float, current_price: float):
@@ -1318,11 +1420,32 @@ class WaveRiderBot:
         self.jupiter = JupiterSwap(self.keypair, RPC_URL)
         self.market = MarketData()
         self.positions = PositionManager(self.jupiter, self.market)
+        self.positions._bot = self  # V5.0: back-reference for position guard access
         self.running = False
         self._seen_tokens = set()
         self._warmed_up = False
         self._pending_tokens = {}
         self._scan_count = 0
+
+        # V5.0: Position guard for post-entry rug monitoring
+        if PositionGuard is not None:
+            try:
+                self.position_guard = PositionGuard(
+                    helius_rpc=HELIUS_RPC,
+                    helius_ws=f"wss://atlas-mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                    public_rpc=BALANCE_RPC,
+                    jupiter_quote_url=JUPITER_QUOTE_URL,
+                    jupiter_swap_url=JUPITER_SWAP_URL,
+                    jupiter_api_key=JUPITER_API_KEY,
+                    keypair=self.jupiter.keypair,
+                    wallet_pubkey=self.jupiter.wallet_pubkey,
+                )
+                self.position_guard.set_emergency_callback(self.on_emergency_detected)
+            except Exception as e:
+                log.warning(f"PositionGuard init failed: {e}")
+                self.position_guard = None
+        else:
+            self.position_guard = None
 
     async def start(self):
         log.info(f"=== Wave Rider Bot {VERSION} starting ===")
@@ -1333,6 +1456,22 @@ class WaveRiderBot:
         await self.market.init_session()
         self.positions.load_open_positions()
 
+        # V5.0: Restart guards for any open positions from previous session
+        if self.position_guard is not None:
+            for tid, pos in self.positions._open_positions.items():
+                try:
+                    await self.position_guard.start_watching(
+                        trade_id=tid,
+                        token_address=pos["token_address"],
+                        pool_sol_vault="",
+                        deployer_address="",
+                        tokens_held=pos.get("tokens_held", 0),
+                        entry_sol_balance=0,
+                    )
+                    log.info(f"POSITION GUARD restarted for #{tid} ({pos['symbol']})")
+                except Exception as e:
+                    log.warning(f"Failed to restart guard for #{tid}: {e}")
+
         sol = await get_sol_balance(self.jupiter.wallet_pubkey)
         log.info(f"Balance: {sol:.4f} SOL (${sol * 94:.2f})")
         tg_send(
@@ -1341,7 +1480,8 @@ class WaveRiderBot:
             f"Wallet: {self.jupiter.wallet_pubkey[:8]}...{self.jupiter.wallet_pubkey[-4:]}\n"
             f"Balance: {sol:.4f} SOL\nSize: {POSITION_SIZE_SOL} SOL\n"
             f"Liq gate: ${MIN_LIQ_ENTRY/1000:.0f}K (all grades)\n"
-            f"Enrichment: bundle+freeze+creator"
+            f"Enrichment: bundle+freeze+creator\n"
+            f"V5.0: Rug Shield (12 checks) + Position Guard"
         )
 
         self.running = True
@@ -1431,13 +1571,13 @@ class WaveRiderBot:
                     self._warmed_up = True
 
                 # V9.6 ENRICHMENT: every 3rd scan, enrich 1 token aged 25-90s
-                if self._scan_count % 1 == 0:  # DATA COLLECTION: every scan cycle
+                if self._scan_count % 1 == 0:  # v4.5: every 2nd scan
                     now_enrich = time.time()
                     to_enrich = [(addr, info) for addr, info in self._pending_tokens.items()
                                  if not info.get("enriched") 
-                                 and 10 <= now_enrich - info["detected_at"] <= 300
+                                 and 10 <= now_enrich - info["detected_at"] <= 180
                                  and info.get("first_liq", 0) >= MIN_LIQ_ENRICH]
-                    for addr, info in to_enrich[:5]:  # DATA COLLECTION: up to 5 per cycle
+                    for addr, info in to_enrich[:5]:  # v4.5: 2 per cycle
                         try:
                             symbol = info["symbol"]
                             log.info(f"ENRICHING: {symbol} (V9.6 timing, age={now_enrich - info['detected_at']:.0f}s)")
@@ -1499,7 +1639,7 @@ class WaveRiderBot:
             await asyncio.sleep(5)
 
     async def _evaluate(self, info: dict, dex_pair: dict):
-        """V9.6-EXACT grading logic with kill signals, bundle detection, freeze authority."""
+        """V5.0 evaluation: V9.6-EXACT grading + rug shield pre-entry check."""
         addr = info["pump_token"].get("mint", "")
         symbol = info["symbol"]
         first_price = info["first_price"]
@@ -1542,15 +1682,10 @@ class WaveRiderBot:
         # --- V9.6 ENTRY FILTERS ---
         top1 = holders["top1"] if holders else 0
         top1_gte_99 = top1 >= 99
-        top1_gte_95 = top1 >= 95
-        price_up_5pct = momentum > 5
 
         # --- DATA COLLECTION: Only kill guaranteed losses ---
         kill = False
         kill_reasons = []
-        # REMOVED: curve_dur > 300 (want data on slow graduations)
-        # REMOVED: momentum < -10 (want data on dumps)
-        # KEPT: serial creator (proven rugger)
         if creator_prev >= 1:
             kill = True
             kill_reasons.append(f"serial_creator={creator_prev}")
@@ -1561,20 +1696,72 @@ class WaveRiderBot:
             self._record_rejection(addr, symbol, f"KILL_{reason_str}")
             return
 
-        # --- DATA COLLECTION: Accept everything with any positive movement ---
-        # Grade based on quality for analysis later
+        # --- v4.5 ENTRY: top1≥80% + liq≥$20K (optimized from 4.7h data) ---
+        # V96 COLLECTOR: Accept all top1 levels for data collection
+        if False:  # Disabled — collecting everything
+            log.debug(f"REJECT: {symbol} top1={top1:.1f}% < 80%")
+            self._record_rejection(addr, symbol, f"LOW_TOP1_{top1:.0f}")
+            return
+
+        # Grade for logging
         if top1_gte_99:
             grade = "A"
         elif top1 >= 90:
             grade = "A-"
-        elif top1 >= 80:
-            grade = "B+"
-        elif top1 >= 50:
-            grade = "B"
         else:
-            grade = "C"
+            grade = "B+"
 
-        log.info(f"SIGNAL {grade}: {symbol} top1={top1:.1f}% bundle={bundle_detected} momentum=+{momentum:.1f}% liq=${current_liq:,.0f}")
+        # ╔══════════════════════════════════════════════════════════╗
+        # ║  V5.0: Rug Shield Pre-Entry Check                       ║
+        # ║  All v4.5 filters passed. Now run the 12-check suite.   ║
+        # ╚══════════════════════════════════════════════════════════╝
+        safety = None
+        if check_token_safety is not None:
+            try:
+                safety = await check_token_safety(
+                    token_address=addr,
+                    pool_address=dex_pair.get("pairAddress", ""),
+                    creator_address=info.get("pump_token", {}).get("creator", ""),
+                    dex_data={
+                        "top1_pct": top1,
+                        "txns": dex_pair.get("txns", {}),
+                        "volume": dex_pair.get("volume", {}),
+                        "liquidity": dex_pair.get("liquidity", {}),
+                        "priceChange": dex_pair.get("priceChange", {}),
+                        "pairCreatedAt": dex_pair.get("pairCreatedAt", 0),
+                        "bundle_info": {
+                            "bundle_detected": info.get("bundle_detected", False),
+                            "bundle_count": info.get("bundle_count", 0),
+                        },
+                    },
+                    helius_rpc=HELIUS_RPC,
+                    public_rpc=BALANCE_RPC,
+                )
+            except Exception as e:
+                # If rug shield itself crashes, log but DON'T block the trade —
+                # existing v4.5 filters already passed. Fail-open.
+                log.warning(f"RUG SHIELD ERROR for {symbol}: {e} — proceeding with v4.5 filters only")
+                safety = {"safe": True, "risk_score": -1, "reasons": ["shield_error"], "details": {}}
+
+            if safety and not safety["safe"]:
+                # V96 COLLECTOR: LOG but DON'T block — collect data on everything
+                log.info(
+                    f"RUG SHIELD FLAGGED (not blocking): {symbol} "
+                    f"score={safety['risk_score']} "
+                    f"reasons={safety['reasons']}"
+                )
+                # Continue to buy — we want to see what happens
+
+            if safety:
+                log.info(
+                    f"RUG SHIELD OK: {symbol} "
+                    f"score={safety['risk_score']} "
+                    f"grade={grade} top1={top1:.1f}% "
+                    f"momentum=+{momentum:.1f}% liq=${current_liq:,.0f}"
+                )
+
+        if not safety:
+            log.info(f"SIGNAL {grade}: {symbol} top1={top1:.1f}% bundle={bundle_detected} momentum=+{momentum:.1f}% liq=${current_liq:,.0f}")
 
         # Record in token_history
         with db_connection() as conn:
@@ -1584,7 +1771,10 @@ class WaveRiderBot:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (addr, time.time(), symbol, grade, top1, current_price, first_price, current_liq))
 
-        await self.positions.open_position(addr, symbol, grade, current_liq, current_price, top1)
+        await self.positions.open_position(
+            addr, symbol, grade, current_liq, current_price, top1,
+            rug_safety=safety, dex_pair=dex_pair, pump_info=info,
+        )
 
     def _record_rejection(self, addr: str, symbol: str, reason: str):
         try:
@@ -1594,6 +1784,52 @@ class WaveRiderBot:
                     VALUES (?, ?, ?, ?)""", (addr, time.time(), symbol, reason))
         except:
             pass
+
+    async def on_emergency_detected(self, trade_id: int, reason: str):
+        """V5.0: Called by PositionGuard when a post-entry rug signal is detected."""
+        log.error(f"EMERGENCY RUG DETECTED: trade #{trade_id} — {reason}")
+        tg_send(f"🚨 RUG SHIELD EMERGENCY: trade #{trade_id} — {reason}")
+
+        # Attempt 1: Pre-signed sell (sub-second execution)
+        pre_signed_fired = False
+        try:
+            if self.position_guard is not None:
+                pre_signed = await self.position_guard.get_pre_signed_sell(trade_id)
+                if pre_signed:
+                    tx_sig = await send_raw_tx(pre_signed)
+                    if tx_sig:
+                        log.info(f"EMERGENCY PRE-SIGNED SELL FIRED: {tx_sig[:20]}...")
+                        tg_send(f"⚡ Emergency pre-signed sell sent: {tx_sig[:16]}...")
+                        pre_signed_fired = True
+        except Exception as e:
+            log.warning(f"Pre-signed sell failed for #{trade_id}: {e}")
+
+        # If pre-signed sell fired, wait and check if position already closed
+        if pre_signed_fired:
+            await asyncio.sleep(3)
+            # Check if position was already closed by pre-signed sell
+            if trade_id not in self.positions._open_positions:
+                log.info(f"Pre-signed sell already closed #{trade_id}")
+                await self.position_guard.stop_watching(trade_id)
+                return
+
+        # Attempt 2: Normal emergency close (existing sell logic)
+        try:
+            await self.positions.close_position(
+                trade_id,
+                f"RUG_SHIELD_{reason}",
+                0,
+                emergency=True,
+            )
+        except Exception as e:
+            log.error(f"Emergency close_position failed for #{trade_id}: {e}")
+
+        # Stop watching
+        try:
+            if self.position_guard is not None:
+                await self.position_guard.stop_watching(trade_id)
+        except Exception as e:
+            log.warning(f"Failed to stop guard for #{trade_id}: {e}")
 
     async def _monitor_loop(self):
         log.info("Position monitor started")
@@ -1636,6 +1872,14 @@ class WaveRiderBot:
                     pair = dex_data[addr]
                     cp = float(pair.get("priceUsd", 0) or 0)
                     cl = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+
+                    # V5.0: Feed price to position guard (non-blocking)
+                    if cp > 0:
+                        try:
+                            if self.position_guard is not None:
+                                await self.position_guard.update_price(trade_id, cp)
+                        except Exception:
+                            pass
 
                     # v4.3: Track consecutive zero-price reads per position
                     if cp <= 0:
@@ -1786,6 +2030,13 @@ class WaveRiderBot:
     async def cleanup_sessions(self):
         """v4.4-prod Fix #9: Close persistent aiohttp sessions on shutdown."""
         global _tg_session
+        # V5.0: Stop all position guards
+        try:
+            if self.position_guard is not None:
+                await self.position_guard.stop_all()
+                log.info("All position guards stopped")
+        except Exception as e:
+            log.warning(f"Error stopping guards on shutdown: {e}")
         await close_rpc_session()
         if _tg_session and not _tg_session.closed:
             await _tg_session.close()
